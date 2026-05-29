@@ -4,6 +4,7 @@ Usage:
     python -m midden.cli ingest <ROOT> [--db PATH] [--label NAME] [--quiet]
     python -m midden.cli stats   [--db PATH]
     python -m midden.cli dups    [--db PATH] [--min-size N] [--json]
+    python -m midden.cli serve   [--db PATH] [--host H] [--port N]
 """
 from __future__ import annotations
 
@@ -58,11 +59,21 @@ def cmd_stats(args) -> int:
     print(f"drives:           {s['drives']}")
     print(f"unique files:     {s['files_unique']}")
     print(f"total path obs:   {s['paths_total']}")
+    print(f"active copies:    {s['paths_active']}")
+    print(f"purgatory copies: {s['paths_purgatory']}")
     print(f"unique bytes:     {s['bytes_unique']:>14,}")
     print(f"total bytes:      {s['bytes_total']:>14,}")
     print(f"dedup savings:    {s['bytes_saveable']:>14,}  "
           f"({100*s['bytes_saveable']/max(s['bytes_total'],1):.1f}%)")
+    if s['bytes_reclaimed']:
+        print(f"reclaimed:        {s['bytes_reclaimed']:>14,}  (in purgatory)")
     store.close()
+    return 0
+
+
+def cmd_serve(args) -> int:
+    from .server import serve
+    serve(args.db, host=args.host, port=args.port)
     return 0
 
 
@@ -102,6 +113,11 @@ def main(argv=None) -> int:
     p_dup.add_argument("--limit", type=int, default=20)
     p_dup.add_argument("--json", action="store_true")
     p_dup.set_defaults(func=cmd_dups)
+
+    p_srv = sub.add_parser("serve", help="run the cluster-review web UI")
+    p_srv.add_argument("--host", default="127.0.0.1")
+    p_srv.add_argument("--port", type=int, default=8000)
+    p_srv.set_defaults(func=cmd_serve)
 
     args = ap.parse_args(argv)
     return args.func(args)

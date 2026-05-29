@@ -1,0 +1,31 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "midden"
+version = "0.1.0"
+description = "Read-only archivist for inherited digital chaos."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Joseph Sorensen", email = "joseph.e.sorensen@gmail.com" }]
+dependencies = []
+
+[project.optional-dependencies]
+# faster hashing; SHA-256 fallback is automatic if absent
+fast = ["blake3"]
+# cluster-review web UI
+web = ["fastapi", "uvicorn"]
+# perceptual image hashing (phase 2)
+images = ["pillow"]
+# LLM topic inference (phase 4)
+llm = ["anthropic"]
+# everything
+all = ["blake3", "fastapi", "uvicorn", "pillow", "anthropic"]
+
+[project.scripts]
+midden = "midden.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["midden"]
