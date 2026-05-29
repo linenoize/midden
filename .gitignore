@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.venv/
+venv/
+
+# Midden runtime data
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+.midden/
+
+# Synthetic test output
+/tmp_corpus/

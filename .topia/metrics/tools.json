@@ -1,0 +1,36 @@
+{
+  "version": 1,
+  "updated": "2026-05-29T22:06:51.256Z",
+  "tools": {
+    "AskUserQuestion": {
+      "total_invocations": 6,
+      "estimated_tokens_total": 2440,
+      "sessions": 2,
+      "last_used": "2026-05-29"
+    },
+    "Edit": {
+      "total_invocations": 14,
+      "estimated_tokens_total": 4532,
+      "sessions": 3,
+      "last_used": "2026-05-29"
+    },
+    "Bash": {
+      "total_invocations": 66,
+      "estimated_tokens_total": 20204,
+      "sessions": 4,
+      "last_used": "2026-05-29"
+    },
+    "Read": {
+      "total_invocations": 20,
+      "estimated_tokens_total": 530,
+      "sessions": 3,
+      "last_used": "2026-05-29"
+    },
+    "Write": {
+      "total_invocations": 24,
+      "estimated_tokens_total": 30080,
+      "sessions": 2,
+      "last_used": "2026-05-29"
+    }
+  }
+}
