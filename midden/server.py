@@ -86,6 +86,17 @@ def create_app(db_path: Path) -> FastAPI:
     def search(q: str, include_purgatory: bool = False) -> dict:
         return {"results": store.search(q, include_purgatory=include_purgatory)}
 
+    @app.get("/api/purgatory")
+    def purgatory() -> dict:
+        return {"items": store.list_purgatory(), **store.purgatory_summary()}
+
+    @app.post("/api/paths/{path_id}/restore")
+    def restore(path_id: int) -> dict:
+        try:
+            return store.restore_path(path_id)
+        except ValueError as e:
+            raise HTTPException(400, str(e))
+
     @app.get("/")
     def index() -> FileResponse:
         return FileResponse(UI_DIR / "index.html")

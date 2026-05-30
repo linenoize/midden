@@ -1,5 +1,10 @@
 # Progress Log
 
+## 2026-05-29 — Phase 3 shipped: purgatory browse + targeted restore
+- **Done:** Phases 1–2 already had the purgatory *core* (status flips, undo-last). Phase 3 adds the browse/restore UX: `store.list_purgatory()` + `purgatory_summary()` + `restore_path()` (reversible — writes a `restore` decision; `undo_last` extended to reverse it). Targeted restore reopens any resolved cluster the restored hash belongs to (restoring a copy re-creates a dup, so it returns to the queue). New endpoints `GET /api/purgatory`, `POST /api/paths/{id}/restore`. UI gets a 4th **Purgatory** tab: table of purgatoried paths, per-row restore, live count/bytes.
+- **Validated:** `tools/e2e_purgatory.py` 16 checks — keep→browse→restore→reopen→undo round-trip, overview consistency, restore-active/restore-unknown both 400. All three suites (review/near/purgatory) green.
+- **Note:** "No deletion ever" still holds — purgatory is the terminal state; there is deliberately no empty-purgatory / hard-delete path (CLAUDE.md decision #3). Restore is the only exit.
+
 ## 2026-05-29 — Phase 2 shipped: near-duplicate detection
 - **Done:** SimHash (text, stdlib `simhash.py`) + dHash (`phash.py`, optional Pillow). `near.py` computes signatures (read-only) and clusters: `doc_version` (directory/stem structural prior + SimHash ≤16, single-linkage) and `near_image` (dHash ≤10). New `signatures` table; `clusters.status` (open|resolved) with migration; clusters now span multiple hashes. CLI `cluster` subcommand; `/api/recluster`. Review UI made kind-aware + multi-hash (was exact-only, would have thrown on `c.hash` for doc_version clusters).
 - **Validated:** `tools/e2e_near.py` 19 checks — both GT version chains recovered exactly, no chain-merge, no purely-noise cluster, multi-hash keep/undo reversibility, idempotent re-run. Phase-1 e2e still green. UI contract + JS-balance verified.

@@ -570,9 +570,85 @@ class Store:
                         (payload.get("prev_canonical"), payload.get("prev_status", "open"),
                          payload["cluster_id"]),
                     )
+                elif row["action"] == "restore":
+                    # reverse a targeted restore: re-purge the path, re-resolve clusters
+                    self.conn.execute(
+                        "UPDATE paths SET status='purgatory' WHERE id=?", (payload["path_id"],))
+                    for r in payload.get("reopened", []):
+                        self.conn.execute(
+                            "UPDATE clusters SET status=?, canonical_hash=? WHERE id=?",
+                            (r["prev_status"], r["prev_canonical"], r["cluster_id"]))
                 self._record_decision("undo", {"target": row["id"], "of_action": row["action"]})
             return {"undone_decision_id": row["id"], "action": row["action"],
                     "cluster_id": payload.get("cluster_id")}
+
+    # ---------- purgatory (browse + targeted restore) ----------
+    def purgatory_summary(self) -> dict:
+        c = self.conn
+        n = c.execute("SELECT COUNT(*) FROM paths WHERE status='purgatory'").fetchone()[0]
+        b = c.execute(
+            "SELECT COALESCE(SUM(f.size),0) FROM paths p JOIN files f ON f.hash=p.hash "
+            "WHERE p.status='purgatory'"
+        ).fetchone()[0]
+        return {"count": n, "bytes": b}
+
+    def list_purgatory(self, limit: int = 1000) -> list[dict]:
+        """All paths currently in purgatory, heaviest first."""
+        rows = self.conn.execute(
+            """
+            SELECT p.id, p.drive_id, p.path, p.hash, f.size, f.mime
+            FROM paths p JOIN files f ON f.hash=p.hash
+            WHERE p.status='purgatory'
+            ORDER BY f.size DESC, p.path
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def restore_path(self, path_id: int) -> dict:
+        """Flip a single purgatory path back to active (reversible).
+
+        If restoring re-creates ambiguity — a resolved cluster containing this
+        hash now has more than one active path again — that cluster is reopened
+        so it returns to the review queue. The decision row captures enough to
+        fully undo (re-purge the path, re-resolve the clusters).
+        """
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT id, hash, status FROM paths WHERE id=?", (path_id,)
+            ).fetchone()
+            if row is None:
+                raise ValueError(f"No such path: {path_id}")
+            if row["status"] != "purgatory":
+                raise ValueError(f"path {path_id} is not in purgatory")
+            h = row["hash"]
+            reopened = []
+            for cr in self.conn.execute(
+                """
+                SELECT c.id, c.status, c.canonical_hash
+                FROM clusters c JOIN cluster_members cm ON cm.cluster_id=c.id
+                WHERE cm.hash=? AND c.status='resolved'
+                """,
+                (h,),
+            ).fetchall():
+                reopened.append({
+                    "cluster_id": cr["id"],
+                    "prev_status": cr["status"],
+                    "prev_canonical": cr["canonical_hash"],
+                })
+            with self.tx():
+                self.conn.execute("UPDATE paths SET status='active' WHERE id=?", (path_id,))
+                for r in reopened:
+                    self.conn.execute(
+                        "UPDATE clusters SET status='open', canonical_hash=NULL WHERE id=?",
+                        (r["cluster_id"],),
+                    )
+                self._record_decision("restore", {
+                    "path_id": path_id, "prev_status": "purgatory", "reopened": reopened,
+                })
+            return {"restored_path_id": path_id,
+                    "reopened_clusters": [r["cluster_id"] for r in reopened]}
 
     # ---------- search ----------
     def search(self, q: str, include_purgatory: bool = False, limit: int = 200) -> list[dict]:

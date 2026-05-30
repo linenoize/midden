@@ -106,6 +106,7 @@
     <button data-view="overview" class="active">Overview</button>
     <button data-view="review">Review</button>
     <button data-view="search">Search</button>
+    <button data-view="purgatory">Purgatory</button>
   </nav>
   <div class="spacer"></div>
   <div class="hint" id="globalHint"></div>
@@ -137,6 +138,14 @@
       <label><input type="checkbox" id="incPurg" /> include purgatory</label>
     </div>
     <div id="searchBody"><p class="hint">Type to search across all indexed paths.</p></div>
+  </section>
+
+  <section class="view" id="view-purgatory">
+    <div class="queue-meta">
+      <span id="purgMeta">—</span>
+      <span class="hint">nothing here is deleted — restore returns a copy to the active set</span>
+    </div>
+    <div id="purgBody"></div>
   </section>
 </main>
 
@@ -170,6 +179,7 @@ const showView = v => {
   if (v==="overview") loadOverview();
   if (v==="review") loadQueue();
   if (v==="search") $("#q").focus();
+  if (v==="purgatory") loadPurgatory();
 };
 document.querySelectorAll("nav button").forEach(b=>b.onclick=()=>showView(b.dataset.view));
 
@@ -294,6 +304,35 @@ async function runSearch(){
       <td>${x.drive_id.slice(0,8)}</td><td>${fmtBytes(x.size)}</td>
       <td>${x.status==='purgatory'?'<span class="badge purg">purgatory</span>':'active'}</td></tr>`).join("")
   }</tbody></table><p class="hint" style="margin-top:10px">${r.results.length} result(s)</p>`;
+}
+
+// ---- purgatory ----
+async function loadPurgatory(){
+  const r = await api("/api/purgatory");
+  $("#purgMeta").textContent = `${r.count} item(s) · ${fmtBytes(r.bytes)} reclaimed`;
+  if (!r.items.length){
+    $("#purgBody").innerHTML = `<div class="empty">Purgatory is empty.<br>
+      <span class="hint">Copies you send to purgatory from the review queue show up here, restorable.</span></div>`;
+    return;
+  }
+  $("#purgBody").innerHTML = `<table><thead><tr>
+    <th>path</th><th>drive</th><th>size</th><th></th></tr></thead><tbody>${
+    r.items.map(x=>`<tr>
+      <td class="path">${x.path}</td>
+      <td>${x.drive_id.slice(0,8)}</td>
+      <td>${fmtBytes(x.size)}</td>
+      <td><button class="act" data-restore="${x.id}">restore</button></td>
+    </tr>`).join("")
+  }</tbody></table>`;
+  document.querySelectorAll("button[data-restore]").forEach(el=>{
+    el.onclick=()=>restorePath(parseInt(el.dataset.restore));
+  });
+}
+async function restorePath(pid){
+  const r = await api(`/api/paths/${pid}/restore`,{method:"POST"});
+  const n = r.reopened_clusters.length;
+  toast(n ? `restored · ${n} cluster(s) reopened` : "restored to active");
+  await loadPurgatory(); refreshHint();
 }
 
 // ---- keyboard ----
