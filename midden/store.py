@@ -1,6 +1,9 @@
 """SQLite access layer for the Midden index.
 
-Single file, WAL mode, single writer convention. Connection per-thread.
+Single file, WAL mode, single writer convention. Connection per-thread (the web
+server passes same_thread=False and serializes writes via self._lock).
+
+This is the ONLY module that touches the schema.
 """
 from __future__ import annotations
 
@@ -49,7 +52,8 @@ CREATE TABLE IF NOT EXISTS clusters (
   kind            TEXT NOT NULL,            -- exact | near_image | doc_version | topic
   label           TEXT,
   canonical_hash  TEXT REFERENCES files(hash),
-  created_at      INTEGER NOT NULL
+  created_at      INTEGER NOT NULL,
+  status          TEXT NOT NULL DEFAULT 'open'  -- open | resolved
 );
 
 CREATE TABLE IF NOT EXISTS cluster_members (
@@ -59,6 +63,14 @@ CREATE TABLE IF NOT EXISTS cluster_members (
   PRIMARY KEY (cluster_id, hash)
 );
 CREATE INDEX IF NOT EXISTS idx_cluster_members_hash ON cluster_members(hash);
+
+CREATE TABLE IF NOT EXISTS signatures (
+  hash   TEXT NOT NULL REFERENCES files(hash),
+  algo   TEXT NOT NULL,   -- simhash_text | phash_image
+  value  TEXT NOT NULL,   -- hex
+  PRIMARY KEY (hash, algo)
+);
+CREATE INDEX IF NOT EXISTS idx_signatures_algo ON signatures(algo);
 
 CREATE TABLE IF NOT EXISTS tags (
   hash        TEXT NOT NULL REFERENCES files(hash),
@@ -101,13 +113,18 @@ class Store:
 
     def _migrate(self) -> None:
         """Idempotent, additive migrations for DBs created before a column existed."""
-        cols = {r["name"] for r in self.conn.execute("PRAGMA table_info(paths)")}
-        if "status" not in cols:
+        path_cols = {r["name"] for r in self.conn.execute("PRAGMA table_info(paths)")}
+        if "status" not in path_cols:
             self.conn.execute(
                 "ALTER TABLE paths ADD COLUMN status TEXT NOT NULL DEFAULT 'active'"
             )
             self.conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_paths_status ON paths(status)"
+            )
+        cluster_cols = {r["name"] for r in self.conn.execute("PRAGMA table_info(clusters)")}
+        if "status" not in cluster_cols:
+            self.conn.execute(
+                "ALTER TABLE clusters ADD COLUMN status TEXT NOT NULL DEFAULT 'open'"
             )
 
     @contextmanager
@@ -177,26 +194,20 @@ class Store:
             (drive_id, rel_path),
         ).fetchone()
 
-    # ---------- queries ----------
+    # ---------- stats ----------
     def stats(self) -> dict:
         c = self.conn
         n_files = c.execute("SELECT COUNT(*) FROM files").fetchone()[0]
         n_paths = c.execute("SELECT COUNT(*) FROM paths").fetchone()[0]
-        n_active = c.execute(
-            "SELECT COUNT(*) FROM paths WHERE status='active'"
-        ).fetchone()[0]
-        n_purgatory = c.execute(
-            "SELECT COUNT(*) FROM paths WHERE status='purgatory'"
-        ).fetchone()[0]
+        n_active = c.execute("SELECT COUNT(*) FROM paths WHERE status='active'").fetchone()[0]
+        n_purgatory = c.execute("SELECT COUNT(*) FROM paths WHERE status='purgatory'").fetchone()[0]
         n_drives = c.execute("SELECT COUNT(*) FROM drives").fetchone()[0]
-        # unique bytes = one copy of each hash that still has an active path
         bytes_unique = c.execute(
             """
             SELECT COALESCE(SUM(size), 0) FROM files
             WHERE hash IN (SELECT DISTINCT hash FROM paths WHERE status='active')
             """
         ).fetchone()[0]
-        # total = every active path observation
         bytes_total = c.execute(
             """
             SELECT COALESCE(SUM(f.size), 0)
@@ -204,7 +215,6 @@ class Store:
             WHERE p.status='active'
             """
         ).fetchone()[0]
-        # already reclaimed = purgatoried path observations
         bytes_reclaimed = c.execute(
             """
             SELECT COALESCE(SUM(f.size), 0)
@@ -225,16 +235,20 @@ class Store:
         }
 
     def overview(self) -> dict:
-        """Stats + review-queue counts for the UI Overview."""
+        """Stats + review-queue counts (all cluster kinds) for the UI Overview."""
         s = self.stats()
         c = self.conn
-        s["clusters_total"] = c.execute(
-            "SELECT COUNT(*) FROM clusters WHERE kind='exact'"
-        ).fetchone()[0]
+        s["clusters_total"] = c.execute("SELECT COUNT(*) FROM clusters").fetchone()[0]
         s["clusters_unresolved"] = c.execute(
-            "SELECT COUNT(*) FROM clusters WHERE kind='exact' AND canonical_hash IS NULL"
+            "SELECT COUNT(*) FROM clusters WHERE status='open'"
         ).fetchone()[0]
         s["clusters_resolved"] = s["clusters_total"] - s["clusters_unresolved"]
+        by_kind = {}
+        for r in c.execute(
+            "SELECT kind, COUNT(*) n FROM clusters WHERE status='open' GROUP BY kind"
+        ):
+            by_kind[r["kind"]] = r["n"]
+        s["open_by_kind"] = by_kind
         return s
 
     def exact_duplicate_groups(self, min_size: int = 1) -> list[dict]:
@@ -265,13 +279,51 @@ class Store:
             })
         return groups
 
-    # ---------- clusters (materialization) ----------
-    def materialize_exact_clusters(self, min_size: int = 1) -> int:
-        """Create a cluster (kind='exact') per duplicated hash. Idempotent.
+    # ---------- signatures (near-dup fingerprints) ----------
+    def upsert_signature(self, hash_: str, algo: str, value: str) -> None:
+        with self._lock:
+            self.conn.execute(
+                """
+                INSERT INTO signatures(hash, algo, value) VALUES (?, ?, ?)
+                ON CONFLICT(hash, algo) DO UPDATE SET value=excluded.value
+                """,
+                (hash_, algo, value),
+            )
 
-        A hash qualifies if it has >1 active path and size >= min_size. Hashes
-        that already have an exact cluster are skipped. Returns # new clusters.
-        """
+    def get_signatures(self, algo: str, active_only: bool = True) -> dict[str, str]:
+        q = "SELECT hash, value FROM signatures WHERE algo=?"
+        if active_only:
+            q += " AND hash IN (SELECT DISTINCT hash FROM paths WHERE status='active')"
+        return {r["hash"]: r["value"] for r in self.conn.execute(q, (algo,))}
+
+    def active_files(self) -> list[dict]:
+        """One active filesystem location per active hash (for reading content)."""
+        rows = self.conn.execute(
+            """
+            SELECT f.hash AS hash, f.mime AS mime, f.size AS size,
+                   d.root_path AS root_path, p.path AS path
+            FROM files f
+            JOIN paths p ON p.hash=f.hash AND p.status='active'
+            JOIN drives d ON d.id=p.drive_id
+            GROUP BY f.hash
+            """
+        ).fetchall()
+        out = []
+        for r in rows:
+            abspath = str(Path(r["root_path"]) / r["path"]) if r["root_path"] else r["path"]
+            out.append({
+                "hash": r["hash"], "mime": r["mime"], "size": r["size"],
+                "abspath": abspath, "rel": r["path"],
+            })
+        return out
+
+    def hashes_with_signature(self, algo: str) -> set[str]:
+        return {r["hash"] for r in self.conn.execute(
+            "SELECT hash FROM signatures WHERE algo=?", (algo,))}
+
+    # ---------- clusters ----------
+    def materialize_exact_clusters(self, min_size: int = 1) -> int:
+        """Create a cluster (kind='exact') per duplicated hash. Idempotent."""
         with self._lock:
             rows = self.conn.execute(
                 """
@@ -284,15 +336,7 @@ class Store:
                 """,
                 (min_size,),
             ).fetchall()
-            existing = {
-                r["hash"] for r in self.conn.execute(
-                    """
-                    SELECT cm.hash FROM clusters c
-                    JOIN cluster_members cm ON cm.cluster_id=c.id
-                    WHERE c.kind='exact'
-                    """
-                )
-            }
+            existing = self.clustered_hashes("exact")
             now = int(time.time())
             created = 0
             with self.tx():
@@ -301,84 +345,121 @@ class Store:
                     if h in existing:
                         continue
                     cur = self.conn.execute(
-                        "INSERT INTO clusters(kind, label, canonical_hash, created_at) "
-                        "VALUES ('exact', NULL, NULL, ?)",
+                        "INSERT INTO clusters(kind, label, canonical_hash, created_at, status) "
+                        "VALUES ('exact', NULL, NULL, ?, 'open')",
                         (now,),
                     )
-                    cid = cur.lastrowid
                     self.conn.execute(
                         "INSERT INTO cluster_members(cluster_id, hash, confidence) VALUES (?, ?, 1.0)",
-                        (cid, h),
+                        (cur.lastrowid, h),
                     )
                     created += 1
             return created
 
-    def _cluster_hash(self, cluster_id: int) -> Optional[str]:
-        row = self.conn.execute(
-            "SELECT hash FROM cluster_members WHERE cluster_id=? LIMIT 1",
-            (cluster_id,),
-        ).fetchone()
-        return row["hash"] if row else None
+    def create_cluster(self, kind: str, member_hashes: list[str],
+                       label: Optional[str] = None, confidence: float = 1.0) -> int:
+        now = int(time.time())
+        with self._lock, self.tx():
+            cur = self.conn.execute(
+                "INSERT INTO clusters(kind, label, canonical_hash, created_at, status) "
+                "VALUES (?, ?, NULL, ?, 'open')",
+                (kind, label, now),
+            )
+            cid = cur.lastrowid
+            for h in member_hashes:
+                self.conn.execute(
+                    "INSERT OR IGNORE INTO cluster_members(cluster_id, hash, confidence) "
+                    "VALUES (?, ?, ?)",
+                    (cid, h, confidence),
+                )
+        return cid
 
-    def list_clusters(self, include_resolved: bool = False, limit: int = 500) -> list[dict]:
-        where = "WHERE c.kind='exact'"
+    def clustered_hashes(self, kind: str) -> set[str]:
+        return {r["hash"] for r in self.conn.execute(
+            """
+            SELECT cm.hash FROM clusters c
+            JOIN cluster_members cm ON cm.cluster_id=c.id
+            WHERE c.kind=?
+            """, (kind,))}
+
+    def _member_hashes(self, cluster_id: int) -> list[str]:
+        return [r["hash"] for r in self.conn.execute(
+            "SELECT hash FROM cluster_members WHERE cluster_id=?", (cluster_id,))]
+
+    def list_clusters(self, include_resolved: bool = False,
+                     kinds: Optional[tuple[str, ...]] = None, limit: int = 500) -> list[dict]:
+        params: list = []
+        where = ["1=1"]
         if not include_resolved:
-            where += " AND c.canonical_hash IS NULL"
+            where.append("c.status='open'")
+        if kinds:
+            where.append("c.kind IN (%s)" % ",".join("?" * len(kinds)))
+            params.extend(kinds)
         rows = self.conn.execute(
             f"""
-            SELECT c.id, cm.hash, f.size, c.canonical_hash,
-                   (SELECT COUNT(*) FROM paths p WHERE p.hash=cm.hash AND p.status='active') AS n_active,
-                   (SELECT COUNT(*) FROM paths p WHERE p.hash=cm.hash) AS n_total
+            SELECT c.id AS id, c.kind AS kind, c.label AS label, c.status AS status,
+                   COUNT(CASE WHEN p.status='active' THEN 1 END) AS n_active,
+                   COUNT(p.id) AS n_total,
+                   COUNT(DISTINCT cm.hash) AS n_members,
+                   COALESCE(SUM(CASE WHEN p.status='active' THEN f.size END), 0) AS active_bytes,
+                   COALESCE(MAX(CASE WHEN p.status='active' THEN f.size END), 0) AS max_active
             FROM clusters c
             JOIN cluster_members cm ON cm.cluster_id=c.id
             JOIN files f ON f.hash=cm.hash
-            {where}
-            ORDER BY f.size * (
-                (SELECT COUNT(*) FROM paths p WHERE p.hash=cm.hash AND p.status='active') - 1
-            ) DESC
+            LEFT JOIN paths p ON p.hash=cm.hash
+            WHERE {" AND ".join(where)}
+            GROUP BY c.id
+            HAVING n_active > 0
+            ORDER BY (active_bytes - max_active) DESC, active_bytes DESC
             LIMIT ?
             """,
-            (limit,),
+            (*params, limit),
         ).fetchall()
         return [
             {
-                "id": r["id"],
-                "hash": r["hash"],
-                "size": r["size"],
-                "n_active": r["n_active"],
-                "n_total": r["n_total"],
-                "resolved": r["canonical_hash"] is not None,
-                "reclaimable": r["size"] * max(r["n_active"] - 1, 0),
+                "id": r["id"], "kind": r["kind"], "label": r["label"],
+                "n_active": r["n_active"], "n_total": r["n_total"],
+                "n_members": r["n_members"],
+                "resolved": r["status"] != "open",
+                "reclaimable": r["active_bytes"] - r["max_active"],
             }
             for r in rows
         ]
 
     def get_cluster(self, cluster_id: int) -> Optional[dict]:
         row = self.conn.execute(
-            "SELECT id, kind, label, canonical_hash, created_at FROM clusters WHERE id=?",
+            "SELECT id, kind, label, canonical_hash, status FROM clusters WHERE id=?",
             (cluster_id,),
         ).fetchone()
         if not row:
             return None
-        h = self._cluster_hash(cluster_id)
-        size = self.conn.execute(
-            "SELECT size, mime FROM files WHERE hash=?", (h,)
-        ).fetchone()
-        paths = self.conn.execute(
-            """
-            SELECT id, drive_id, path, mtime, ctime, status
-            FROM paths WHERE hash=? ORDER BY status, path
-            """,
-            (h,),
-        ).fetchall()
+        members = []
+        flat_paths = []
+        for h in self._member_hashes(cluster_id):
+            f = self.conn.execute("SELECT size, mime FROM files WHERE hash=?", (h,)).fetchone()
+            ps = self.conn.execute(
+                "SELECT id, drive_id, path, mtime, status FROM paths WHERE hash=? ORDER BY status, path",
+                (h,),
+            ).fetchall()
+            paths = [dict(p) for p in ps]
+            members.append({
+                "hash": h,
+                "size": f["size"] if f else 0,
+                "mime": f["mime"] if f else None,
+                "paths": paths,
+            })
+            for p in paths:
+                flat_paths.append({**p, "hash": h, "size": f["size"] if f else 0})
+        actives = [p for p in flat_paths if p["status"] == "active"]
+        reclaimable = sum(p["size"] for p in actives) - max((p["size"] for p in actives), default=0)
         return {
-            "id": row["id"],
-            "kind": row["kind"],
-            "hash": h,
-            "size": size["size"] if size else 0,
-            "mime": size["mime"] if size else None,
-            "resolved": row["canonical_hash"] is not None,
-            "paths": [dict(p) for p in paths],
+            "id": row["id"], "kind": row["kind"], "label": row["label"],
+            "resolved": row["status"] != "open",
+            "n_members": len(members),
+            "n_active": len(actives),
+            "reclaimable": reclaimable,
+            "members": members,
+            "paths": flat_paths,
         }
 
     # ---------- review actions (all reversible via decisions) ----------
@@ -389,61 +470,65 @@ class Store:
         )
         return cur.lastrowid
 
+    def _active_member_paths(self, cluster_id: int) -> list[sqlite3.Row]:
+        hs = self._member_hashes(cluster_id)
+        if not hs:
+            return []
+        ph = ",".join("?" * len(hs))
+        return self.conn.execute(
+            f"SELECT id, hash, status FROM paths WHERE hash IN ({ph}) AND status='active'",
+            hs,
+        ).fetchall()
+
+    def _cluster_state(self, cluster_id: int) -> sqlite3.Row:
+        return self.conn.execute(
+            "SELECT canonical_hash, status FROM clusters WHERE id=?", (cluster_id,)
+        ).fetchone()
+
     def resolve_keep(self, cluster_id: int, keep_path_id: int) -> dict:
-        """Keep one path; send the cluster's other active paths to purgatory."""
+        """Keep one path; send every other active path in the cluster to purgatory."""
         with self._lock:
-            h = self._cluster_hash(cluster_id)
-            if h is None:
-                raise ValueError(f"No such cluster: {cluster_id}")
-            actives = self.conn.execute(
-                "SELECT id, status FROM paths WHERE hash=? AND status='active'", (h,)
-            ).fetchall()
-            ids = {r["id"] for r in actives}
-            if keep_path_id not in ids:
+            actives = self._active_member_paths(cluster_id)
+            if not actives:
+                raise ValueError(f"Cluster {cluster_id} has no active paths")
+            by_id = {r["id"]: r for r in actives}
+            if keep_path_id not in by_id:
                 raise ValueError(f"path {keep_path_id} is not an active member of cluster {cluster_id}")
-            prev_canonical = self.conn.execute(
-                "SELECT canonical_hash FROM clusters WHERE id=?", (cluster_id,)
-            ).fetchone()["canonical_hash"]
-            purged = [{"id": r["id"], "prev_status": "active"} for r in actives if r["id"] != keep_path_id]
+            keep_hash = by_id[keep_path_id]["hash"]
+            prev = self._cluster_state(cluster_id)
+            purged = [{"id": r["id"], "prev_status": "active"}
+                      for r in actives if r["id"] != keep_path_id]
             with self.tx():
                 for p in purged:
-                    self.conn.execute(
-                        "UPDATE paths SET status='purgatory' WHERE id=?", (p["id"],)
-                    )
+                    self.conn.execute("UPDATE paths SET status='purgatory' WHERE id=?", (p["id"],))
                 self.conn.execute(
-                    "UPDATE clusters SET canonical_hash=? WHERE id=?", (h, cluster_id)
+                    "UPDATE clusters SET canonical_hash=?, status='resolved' WHERE id=?",
+                    (keep_hash, cluster_id),
                 )
                 self._record_decision("resolve_keep", {
-                    "cluster_id": cluster_id, "hash": h,
-                    "kept_path_id": keep_path_id, "purged": purged,
-                    "prev_canonical": prev_canonical,
+                    "cluster_id": cluster_id, "kept_path_id": keep_path_id,
+                    "purged": purged,
+                    "prev_canonical": prev["canonical_hash"], "prev_status": prev["status"],
                 })
             return self.get_cluster(cluster_id)
 
     def purge_all(self, cluster_id: int) -> dict:
         """Send every active path in the cluster to purgatory."""
         with self._lock:
-            h = self._cluster_hash(cluster_id)
-            if h is None:
-                raise ValueError(f"No such cluster: {cluster_id}")
-            actives = self.conn.execute(
-                "SELECT id FROM paths WHERE hash=? AND status='active'", (h,)
-            ).fetchall()
-            prev_canonical = self.conn.execute(
-                "SELECT canonical_hash FROM clusters WHERE id=?", (cluster_id,)
-            ).fetchone()["canonical_hash"]
+            actives = self._active_member_paths(cluster_id)
+            if not actives:
+                raise ValueError(f"Cluster {cluster_id} has no active paths")
+            prev = self._cluster_state(cluster_id)
             purged = [{"id": r["id"], "prev_status": "active"} for r in actives]
             with self.tx():
                 for p in purged:
-                    self.conn.execute(
-                        "UPDATE paths SET status='purgatory' WHERE id=?", (p["id"],)
-                    )
+                    self.conn.execute("UPDATE paths SET status='purgatory' WHERE id=?", (p["id"],))
                 self.conn.execute(
-                    "UPDATE clusters SET canonical_hash=? WHERE id=?", (h, cluster_id)
+                    "UPDATE clusters SET status='resolved' WHERE id=?", (cluster_id,)
                 )
                 self._record_decision("purge_all", {
-                    "cluster_id": cluster_id, "hash": h,
-                    "purged": purged, "prev_canonical": prev_canonical,
+                    "cluster_id": cluster_id, "purged": purged,
+                    "prev_canonical": prev["canonical_hash"], "prev_status": prev["status"],
                 })
             return self.get_cluster(cluster_id)
 
@@ -468,12 +553,11 @@ class Store:
                 if row["action"] in ("resolve_keep", "purge_all"):
                     for p in payload.get("purged", []):
                         self.conn.execute(
-                            "UPDATE paths SET status=? WHERE id=?",
-                            (p["prev_status"], p["id"]),
-                        )
+                            "UPDATE paths SET status=? WHERE id=?", (p["prev_status"], p["id"]))
                     self.conn.execute(
-                        "UPDATE clusters SET canonical_hash=? WHERE id=?",
-                        (payload.get("prev_canonical"), payload["cluster_id"]),
+                        "UPDATE clusters SET canonical_hash=?, status=? WHERE id=?",
+                        (payload.get("prev_canonical"), payload.get("prev_status", "open"),
+                         payload["cluster_id"]),
                     )
                 self._record_decision("undo", {"target": row["id"], "of_action": row["action"]})
             return {"undone_decision_id": row["id"], "action": row["action"],

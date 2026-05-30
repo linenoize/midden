@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "updated": "2026-05-29T22:06:51.256Z",
+  "updated": "2026-05-29T23:29:32.842Z",
   "tools": {
     "AskUserQuestion": {
       "total_invocations": 6,
@@ -9,27 +9,63 @@
       "last_used": "2026-05-29"
     },
     "Edit": {
-      "total_invocations": 14,
-      "estimated_tokens_total": 4532,
-      "sessions": 3,
-      "last_used": "2026-05-29"
-    },
-    "Bash": {
-      "total_invocations": 66,
-      "estimated_tokens_total": 20204,
+      "total_invocations": 16,
+      "estimated_tokens_total": 5082,
       "sessions": 4,
       "last_used": "2026-05-29"
     },
+    "Bash": {
+      "total_invocations": 130,
+      "estimated_tokens_total": 24228,
+      "sessions": 5,
+      "last_used": "2026-05-29"
+    },
     "Read": {
-      "total_invocations": 20,
-      "estimated_tokens_total": 530,
-      "sessions": 3,
+      "total_invocations": 24,
+      "estimated_tokens_total": 584,
+      "sessions": 4,
       "last_used": "2026-05-29"
     },
     "Write": {
+      "total_invocations": 26,
+      "estimated_tokens_total": 32752,
+      "sessions": 3,
+      "last_used": "2026-05-29"
+    },
+    "PowerShell": {
       "total_invocations": 24,
-      "estimated_tokens_total": 30080,
-      "sessions": 2,
+      "estimated_tokens_total": 1710,
+      "sessions": 1,
+      "last_used": "2026-05-29"
+    },
+    "Glob": {
+      "total_invocations": 2,
+      "estimated_tokens_total": 12,
+      "sessions": 1,
+      "last_used": "2026-05-29"
+    },
+    "ToolSearch": {
+      "total_invocations": 4,
+      "estimated_tokens_total": 46,
+      "sessions": 1,
+      "last_used": "2026-05-29"
+    },
+    "TaskList": {
+      "total_invocations": 1,
+      "estimated_tokens_total": 0,
+      "sessions": 1,
+      "last_used": "2026-05-29"
+    },
+    "ScheduleWakeup": {
+      "total_invocations": 6,
+      "estimated_tokens_total": 280,
+      "sessions": 1,
+      "last_used": "2026-05-29"
+    },
+    "TaskStop": {
+      "total_invocations": 2,
+      "estimated_tokens_total": 10,
+      "sessions": 1,
       "last_used": "2026-05-29"
     }
   }

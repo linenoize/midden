@@ -1,9 +1,10 @@
 """Midden CLI.
 
 Usage:
-    python -m midden.cli ingest <ROOT> [--db PATH] [--label NAME] [--quiet]
+    python -m midden.cli ingest  <ROOT> [--db PATH] [--label NAME] [--quiet]
     python -m midden.cli stats   [--db PATH]
     python -m midden.cli dups    [--db PATH] [--min-size N] [--json]
+    python -m midden.cli cluster [--db PATH]               # exact + near-dup detection
     python -m midden.cli serve   [--db PATH] [--host H] [--port N]
 """
 from __future__ import annotations
@@ -71,12 +72,6 @@ def cmd_stats(args) -> int:
     return 0
 
 
-def cmd_serve(args) -> int:
-    from .server import serve
-    serve(args.db, host=args.host, port=args.port)
-    return 0
-
-
 def cmd_dups(args) -> int:
     store = Store(args.db)
     groups = store.exact_duplicate_groups(min_size=args.min_size)
@@ -90,6 +85,29 @@ def cmd_dups(args) -> int:
                 print(f"     - [{p['drive_id'][:8]}] {p['path']}")
             print()
     store.close()
+    return 0
+
+
+def cmd_cluster(args) -> int:
+    from . import near
+    store = Store(args.db)
+    n_exact = store.materialize_exact_clusters()
+    print(f"[cluster] exact-dup clusters: +{n_exact} new")
+    r = near.recluster(store)
+    print(f"[cluster] text signatures:    +{r['text_signatures']} computed")
+    print(f"[cluster] image signatures:   +{r['image_signatures']} computed"
+          f"{'  (Pillow not installed)' if not near.phash.PIL_AVAILABLE else ''}")
+    print(f"[cluster] doc_version:        +{r['doc_version_clusters']} new")
+    print(f"[cluster] near_image:         +{r['near_image_clusters']} new")
+    ov = store.overview()
+    print(f"[cluster] open queue: {ov['clusters_unresolved']} clusters {dict(ov['open_by_kind'])}")
+    store.close()
+    return 0
+
+
+def cmd_serve(args) -> int:
+    from .server import serve
+    serve(args.db, host=args.host, port=args.port)
     return 0
 
 
@@ -113,6 +131,9 @@ def main(argv=None) -> int:
     p_dup.add_argument("--limit", type=int, default=20)
     p_dup.add_argument("--json", action="store_true")
     p_dup.set_defaults(func=cmd_dups)
+
+    p_cl = sub.add_parser("cluster", help="detect exact + near duplicates")
+    p_cl.set_defaults(func=cmd_cluster)
 
     p_srv = sub.add_parser("serve", help="run the cluster-review web UI")
     p_srv.add_argument("--host", default="127.0.0.1")
