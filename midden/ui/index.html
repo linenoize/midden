@@ -215,24 +215,38 @@ async function renderCluster(){
   currentCluster = c;
   $("#qPos").textContent = `${qi+1} / ${queue.length}`;
   const actives = c.paths.filter(p=>p.status==="active");
-  const reclaim = c.size * Math.max(actives.length-1,0);
-  const rows = c.paths.map((p,i)=>{
+  const multi = c.kind !== "exact";   // doc_version / near_image span distinct hashes
+  const KIND = {
+    exact:       {title:"Exact duplicate",  noun:"copy",    nouns:"copies",
+                  hint:"identical bytes — keep one, the rest go to purgatory"},
+    doc_version: {title:"Document versions", noun:"version", nouns:"versions",
+                  hint:"near-duplicate text — keep the version you want"},
+    near_image:  {title:"Similar images",    noun:"image",   nouns:"images",
+                  hint:"visually similar — keep one"},
+  }[c.kind] || {title:c.kind, noun:"item", nouns:"items", hint:""};
+  const rows = c.paths.map((p)=>{
     const activeIdx = p.status==="active" ? actives.indexOf(p)+1 : null;
     const badge = p.status==="purgatory"
       ? `<span class="badge purg">purgatory</span>` : "";
+    // for multi-hash clusters each path is a distinct file — show its own size + hash
+    const meta = multi
+      ? `<div class="drive">drive ${p.drive_id.slice(0,8)} · ${fmtBytes(p.size)} · ${p.hash.slice(0,8)}</div>`
+      : `<div class="drive">drive ${p.drive_id.slice(0,8)}</div>`;
     return `<div class="p ${p.status==='purgatory'?'purged':''}" data-pid="${p.id}" data-keep="${p.status==='active'}">
       <div class="idx">${activeIdx??"·"}</div>
-      <div><div class="path">${p.path}</div>
-      <div class="drive">drive ${p.drive_id.slice(0,8)}</div></div>
+      <div><div class="path">${p.path}</div>${meta}</div>
       <div class="spacer" style="flex:1"></div>${badge}</div>`;
   }).join("");
+  const sub = multi
+    ? `${c.n_active} ${c.n_active===1?KIND.noun:KIND.nouns} · ${fmtBytes(c.reclaimable)} reclaimable`
+    : `${fmtBytes(actives[0]?.size||0)} each · ${fmtBytes(c.reclaimable)} reclaimable · ${actives[0]?.hash.slice(0,16)||""}…`;
   $("#reviewBody").innerHTML = `
     <div class="cluster ${c.resolved?'resolved':''}">
-      <h2>Exact duplicate · ${actives.length} active ${actives.length===1?'copy':'copies'}</h2>
-      <div class="sub">${fmtBytes(c.size)} each · ${fmtBytes(reclaim)} reclaimable · ${c.mime||"unknown type"} · ${c.hash.slice(0,16)}…</div>
+      <h2>${KIND.title} · ${actives.length} active ${actives.length===1?KIND.noun:KIND.nouns}</h2>
+      <div class="sub">${sub}</div>
       <div class="paths">${rows}</div>
       <div class="actions">
-        <span class="hint">click a copy or press its number to keep it →</span>
+        <span class="hint">${KIND.hint} — click one or press its number; <kbd>P</kbd> purges all</span>
       </div>
     </div>`;
   document.querySelectorAll(".p[data-keep='true']").forEach(el=>{

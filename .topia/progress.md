@@ -1,5 +1,11 @@
 # Progress Log
 
+## 2026-05-29 — Phase 2 shipped: near-duplicate detection
+- **Done:** SimHash (text, stdlib `simhash.py`) + dHash (`phash.py`, optional Pillow). `near.py` computes signatures (read-only) and clusters: `doc_version` (directory/stem structural prior + SimHash ≤16, single-linkage) and `near_image` (dHash ≤10). New `signatures` table; `clusters.status` (open|resolved) with migration; clusters now span multiple hashes. CLI `cluster` subcommand; `/api/recluster`. Review UI made kind-aware + multi-hash (was exact-only, would have thrown on `c.hash` for doc_version clusters).
+- **Validated:** `tools/e2e_near.py` 19 checks — both GT version chains recovered exactly, no chain-merge, no purely-noise cluster, multi-hash keep/undo reversibility, idempotent re-run. Phase-1 e2e still green. UI contract + JS-balance verified.
+- **Process note:** first phase-2 commit (2b98d49) shipped with a failing test (threshold guessed at 12 before the tuning probe ran; real max intra-chain distance is 15). Fixed in eafdde6 by measurement, plus a latent `_VER` regex bug that collapsed enumerated junk files into one stem. Don't commit on red again.
+- **Deferred:** near_image has no synthetic ground truth (corpus images are random bytes, not real images) — detection path is exercised for graceful no-op only; needs real-image fixtures to validate dHash. Threshold 16 is tuned to *this* corpus; revisit on real data.
+
 ## 2026-05-29 — Phase 1 shipped: cluster-review UI + purgatory + undo
 - **Done:** Materialize exact-dup clusters → `clusters`/`cluster_members`. FastAPI JSON API + single-page keyboard-driven review UI (J/K/1-9/P/X/U), Overview, Search. Thin purgatory slice (`paths.status`, additive migration). `resolve_keep`/`purge_all`/`undo_last` all write reversible `decisions` rows. CLI `serve` subcommand; `stats` shows active/purgatory/reclaimed. `pyproject.toml` added.
 - **Validated:** `tools/e2e_review.py` — 22 checks pass incl. full purge→undo→restore reversibility. Live HTTP smoke test passed. Commit `6c9d87d`.
