@@ -30,11 +30,19 @@ IMAGE_EXT = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tiff", ".webp"}
 ALGO_TEXT = "simhash_text"
 ALGO_IMAGE = "phash_image"
 
-DOC_VERSION_THRESHOLD = 12   # max SimHash Hamming distance to link two docs
+# Tuned on the synthetic corpus (tools/e2e_near.py). Measured intra-chain
+# consecutive SimHash distances at k=4 reach 15 (heavily-edited manuscript
+# chain); random cross-document pairs sit at median ~32, p5 ~25. 16 clears the
+# real chains with margin while staying well under the noise floor.
+DOC_VERSION_THRESHOLD = 16   # max SimHash Hamming distance to link two docs
 NEAR_IMAGE_THRESHOLD = 10    # max dHash Hamming distance to link two images
 TEXT_READ_BYTES = 256 * 1024
 
-_VER = re.compile(r"(_v?\d+|_final|_revised|_backup|_copy|\bfinal\b)", re.I)
+# Version markers stripped to derive a shared stem. NOTE: the digit form REQUIRES
+# a leading 'v' (_v1, _v2). A bare _<number> is NOT treated as a version — doing
+# so collapsed enumerated junk like file_000/file_001 to one stem ("file"),
+# making all scattered noise files mutual clustering candidates.
+_VER = re.compile(r"(_v\d+|_final|_revised|_backup|_copy|\bfinal\b)", re.I)
 
 
 def _norm_stem(rel: str) -> str:
@@ -108,10 +116,6 @@ def _components(nodes: Iterable[str], edges: Iterable[tuple[str, str]]) -> list[
     return [g for g in groups.values() if len(g) >= 2]
 
 
-def _representative_locations(store: Store) -> dict[str, dict]:
-    return {f["hash"]: f for f in store.active_files()}
-
-
 def materialize_doc_versions(store: Store, threshold: int = DOC_VERSION_THRESHOLD) -> int:
     """Build doc_version clusters from stored text signatures. Idempotent.
 
@@ -122,20 +126,24 @@ def materialize_doc_versions(store: Store, threshold: int = DOC_VERSION_THRESHOL
     sigs_hex = store.get_signatures(ALGO_TEXT)
     if len(sigs_hex) < 2:
         return 0
-    locs = _representative_locations(store)
-    sigs = {h: simhash.from_hex(v) for h, v in sigs_hex.items() if h in locs}
+    sigs = {h: simhash.from_hex(v) for h, v in sigs_hex.items()}
 
-    by_dir: dict[str, list[str]] = {}
-    by_stem: dict[str, list[str]] = {}
-    for h in sigs:
-        rel = locs[h]["rel"]
-        by_dir.setdefault(str(Path(rel).parent), []).append(h)
-        by_stem.setdefault(_norm_stem(rel), []).append(h)
+    # Bucket by structural key over ALL active paths (a hash with copies in
+    # several folders becomes a candidate in each). Sets dedup repeats.
+    by_dir: dict[str, set[str]] = {}
+    by_stem: dict[str, set[str]] = {}
+    for ap in store.active_paths():
+        h = ap["hash"]
+        if h not in sigs:
+            continue
+        rel = ap["rel"]
+        by_dir.setdefault(str(Path(rel).parent), set()).add(h)
+        by_stem.setdefault(_norm_stem(rel), set()).add(h)
 
     edges: list[tuple[str, str]] = []
     seen: set[tuple[str, str]] = set()
     for group in itertools.chain(by_dir.values(), by_stem.values()):
-        for a, b in itertools.combinations(group, 2):
+        for a, b in itertools.combinations(sorted(group), 2):
             key = (a, b) if a < b else (b, a)
             if key in seen:
                 continue

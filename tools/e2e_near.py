@@ -80,6 +80,13 @@ def main() -> int:
     check("no doc_version cluster merges two distinct chains",
           not any(merges_two(s) for s in dv_sets))
 
+    # every doc_version cluster must touch a real chain — guards against the
+    # noise-stem collapse (enumerated junk files clustering with each other)
+    def touches_chain(s):
+        return any(chain & s for chain in gt_chains)
+    check("no purely-noise doc_version cluster",
+          all(touches_chain(s) for s in dv_sets))
+
     check("image signatures handled without crash (0 expected here)",
           result["image_signatures"] == 0)
     check("near_image clusters: 0 (no real images / no ground truth)",

@@ -321,6 +321,17 @@ class Store:
         return {r["hash"] for r in self.conn.execute(
             "SELECT hash FROM signatures WHERE algo=?", (algo,))}
 
+    def active_paths(self) -> list[dict]:
+        """Every active path observation (NOT collapsed by hash).
+
+        Near-dup candidate bucketing needs all of a hash's locations — a file
+        copied into two folders should be a clustering candidate in both.
+        """
+        rows = self.conn.execute(
+            "SELECT hash, path FROM paths WHERE status='active'"
+        ).fetchall()
+        return [{"hash": r["hash"], "rel": r["path"]} for r in rows]
+
     # ---------- clusters ----------
     def materialize_exact_clusters(self, min_size: int = 1) -> int:
         """Create a cluster (kind='exact') per duplicated hash. Idempotent."""
