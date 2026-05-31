@@ -249,6 +249,14 @@ class Store:
         ):
             by_kind[r["kind"]] = r["n"]
         s["open_by_kind"] = by_kind
+        # The dedup review queue is exact/doc_version/near_image only — topic
+        # clusters are non-destructive groupings shown in the Projects view, so
+        # they must not inflate the "to review" count or they'd never clear.
+        dedup_kinds = ("exact", "doc_version", "near_image")
+        s["clusters_dedup_open"] = sum(v for k, v in by_kind.items() if k in dedup_kinds)
+        s["topic_clusters"] = c.execute(
+            "SELECT COUNT(*) FROM clusters WHERE kind='topic'"
+        ).fetchone()[0]
         return s
 
     def exact_duplicate_groups(self, min_size: int = 1) -> list[dict]:
@@ -295,6 +303,56 @@ class Store:
         if active_only:
             q += " AND hash IN (SELECT DISTINCT hash FROM paths WHERE status='active')"
         return {r["hash"]: r["value"] for r in self.conn.execute(q, (algo,))}
+
+    # ---------- tags (rule | llm | user) ----------
+    def upsert_tag(self, hash_: str, key: str, value: str,
+                   source: str, confidence: float = 1.0) -> None:
+        with self._lock:
+            self.conn.execute(
+                """
+                INSERT INTO tags(hash, key, value, source, confidence)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(hash, key, value) DO UPDATE SET
+                  source=excluded.source, confidence=excluded.confidence
+                """,
+                (hash_, key, value, source, confidence),
+            )
+
+    def tags_for(self, hash_: str) -> list[dict]:
+        return [dict(r) for r in self.conn.execute(
+            "SELECT key, value, source, confidence FROM tags WHERE hash=?", (hash_,))]
+
+    def hashes_with_tag(self, key: str, source: Optional[str] = None) -> set[str]:
+        q, params = "SELECT DISTINCT hash FROM tags WHERE key=?", [key]
+        if source:
+            q += " AND source=?"
+            params.append(source)
+        return {r["hash"] for r in self.conn.execute(q, params)}
+
+    def topic_groups(self, min_size: int = 2) -> list[dict]:
+        """Active hashes grouped by their `topic_slug` tag, groups of >= min_size.
+
+        Each group carries a representative human label (the `topic` tag). This is
+        the basis for kind='topic' clusters — non-redundant "looks like one project"
+        groupings, distinct from the dedup cluster kinds.
+        """
+        rows = self.conn.execute(
+            """
+            SELECT ts.value AS slug, ts.hash AS hash,
+                   (SELECT value FROM tags WHERE hash=ts.hash AND key='topic' LIMIT 1) AS label
+            FROM tags ts
+            WHERE ts.key='topic_slug'
+              AND ts.hash IN (SELECT DISTINCT hash FROM paths WHERE status='active')
+            """
+        ).fetchall()
+        by: dict[str, dict] = {}
+        for r in rows:
+            g = by.setdefault(r["slug"], {"slug": r["slug"], "label": r["label"] or r["slug"], "hashes": set()})
+            g["hashes"].add(r["hash"])
+        return [
+            {"slug": g["slug"], "label": g["label"], "hashes": sorted(g["hashes"])}
+            for g in by.values() if len(g["hashes"]) >= min_size
+        ]
 
     def active_files(self) -> list[dict]:
         """One active filesystem location per active hash (for reading content)."""

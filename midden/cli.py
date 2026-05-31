@@ -5,6 +5,7 @@ Usage:
     python -m midden.cli stats   [--db PATH]
     python -m midden.cli dups    [--db PATH] [--min-size N] [--json]
     python -m midden.cli cluster [--db PATH]               # exact + near-dup detection
+    python -m midden.cli topics  [--db PATH] [--backend auto|stub|ollama|anthropic]
     python -m midden.cli serve   [--db PATH] [--host H] [--port N]
 """
 from __future__ import annotations
@@ -105,6 +106,47 @@ def cmd_cluster(args) -> int:
     return 0
 
 
+def cmd_topics(args) -> int:
+    from . import topics
+    store = Store(args.db)
+    backend = topics.resolve_backend(args.backend)
+    if backend == "ollama":
+        ok, models = topics.ollama_available()
+        if not ok:
+            print("[topics] ollama not reachable at localhost:11434 — start it, or "
+                  "use --backend stub", file=sys.stderr)
+            store.close()
+            return 1
+        print(f"[topics] backend=ollama model={args.model or topics.DEFAULT_OLLAMA_MODEL} "
+              f"(available: {', '.join(models) or 'none'})")
+    elif backend == "anthropic" and not topics.anthropic_available():
+        print("[topics] anthropic unavailable — set ANTHROPIC_API_KEY and "
+              "`pip install anthropic`, or use --backend stub", file=sys.stderr)
+        store.close()
+        return 1
+    else:
+        print(f"[topics] backend={backend}")
+
+    n = 0
+    for ev in topics.compute_topics(store, backend=backend, model=args.model or None,
+                                    limit=args.limit or None):
+        if ev["kind"] == "started":
+            print(f"[topics] tagging {ev['total']} untagged doc(s)…")
+        elif ev["kind"] == "progress":
+            n += 1
+            if not args.quiet:
+                tail = f" -> {ev['topic']}" if ev["topic"] else " -> (no topic)"
+                print(f"  [{ev['i']}/{ev['total']}] {ev['path']}{tail}")
+        elif ev["kind"] == "error":
+            print(f"  ERROR {ev['path']}: {ev['error']}", file=sys.stderr)
+        elif ev["kind"] == "tagged_done":
+            print(f"[topics] tagged={ev['tagged']} skipped={ev['skipped']} errors={ev['errors']}")
+    created = topics.materialize_topics(store)
+    print(f"[topics] topic clusters: +{created} new")
+    store.close()
+    return 0
+
+
 def cmd_serve(args) -> int:
     from .server import serve
     serve(args.db, host=args.host, port=args.port)
@@ -134,6 +176,14 @@ def main(argv=None) -> int:
 
     p_cl = sub.add_parser("cluster", help="detect exact + near duplicates")
     p_cl.set_defaults(func=cmd_cluster)
+
+    p_tp = sub.add_parser("topics", help="infer document topics + cluster by project")
+    p_tp.add_argument("--backend", choices=["auto", "stub", "ollama", "anthropic"],
+                      default="auto", help="inference backend (auto: ollama if up, else stub)")
+    p_tp.add_argument("--model", default="", help="model name (backend-specific)")
+    p_tp.add_argument("--limit", type=int, default=0, help="cap docs processed (0 = all)")
+    p_tp.add_argument("--quiet", action="store_true")
+    p_tp.set_defaults(func=cmd_topics)
 
     p_srv = sub.add_parser("serve", help="run the cluster-review web UI")
     p_srv.add_argument("--host", default="127.0.0.1")

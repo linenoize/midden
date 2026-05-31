@@ -114,6 +114,19 @@
   #ipStatus { margin:14px 0; color:var(--dim); min-height:1.4em; word-break:break-all; }
   #ingestActions { display:none; gap:8px; flex-wrap:wrap; margin-top:16px; }
   code { background:#0d0f15; border:1px solid var(--line); border-radius:4px; padding:0 4px; font-size:12px; }
+
+  /* projects */
+  .ingest-form select {
+    background:var(--panel); border:1px solid var(--line); color:var(--ink);
+    padding:8px 10px; border-radius:8px; font:inherit;
+  }
+  .project { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:14px 16px; margin-bottom:10px; }
+  .project h2 { margin:0 0 2px; font-size:15px; }
+  .project .sub { color:var(--dim); font-size:12px; cursor:pointer; }
+  .project .files { display:none; margin-top:12px; }
+  .project.open .files { display:block; }
+  .project .frow { padding:6px 0; border-top:1px solid var(--line); word-break:break-all; }
+  .project .frow .drive { color:var(--dim); font-size:11px; }
   .toast {
     position:fixed; bottom:20px; left:50%; transform:translateX(-50%);
     background:var(--panel); border:1px solid var(--line); padding:10px 16px;
@@ -129,6 +142,7 @@
     <button data-view="overview" class="active">Overview</button>
     <button data-view="ingest">Ingest</button>
     <button data-view="review">Review</button>
+    <button data-view="projects">Projects</button>
     <button data-view="search">Search</button>
     <button data-view="purgatory">Purgatory</button>
   </nav>
@@ -193,6 +207,22 @@
     <div id="reviewBody"></div>
   </section>
 
+  <section class="view" id="view-projects">
+    <div class="queue-meta">
+      <span id="projMeta">—</span>
+      <span class="hint">topics group files that look like one project — grouping only, never a delete</span>
+    </div>
+    <div class="ingest-form" style="margin-bottom:14px">
+      <label class="hint" style="display:flex;align-items:center;gap:6px">backend
+        <select id="topicBackend"></select>
+      </label>
+      <button class="act" id="inferBtn">Infer topics</button>
+      <span class="hint" id="topicBackendNote"></span>
+    </div>
+    <p id="topicStatus" class="hint" style="display:none"></p>
+    <div id="projBody"></div>
+  </section>
+
   <section class="view" id="view-search">
     <div class="searchbar">
       <input type="text" id="q" placeholder="search paths…" autocomplete="off" />
@@ -240,6 +270,7 @@ const showView = v => {
   if (v==="overview") loadOverview();
   if (v==="ingest" && !ingestInit){ ingestInit=true; loadDirs(""); }
   if (v==="review") loadQueue();
+  if (v==="projects") loadProjects();
   if (v==="search") $("#q").focus();
   if (v==="purgatory") loadPurgatory();
 };
@@ -249,19 +280,19 @@ document.querySelectorAll("nav button").forEach(b=>b.onclick=()=>showView(b.data
 async function loadOverview(){
   const o = await api("/api/overview");
   const cards = [
-    ["clusters_unresolved","clusters to review","accent"],
+    ["clusters_dedup_open","clusters to review","accent"],
+    ["topic_clusters","projects (topics)","accent"],
     ["bytes_saveable","reclaimable (dedup)","good", fmtBytes],
     ["bytes_reclaimed","already in purgatory","warn", fmtBytes],
     ["files_unique","unique files",""],
     ["paths_active","active copies",""],
     ["paths_purgatory","purgatoried copies",""],
     ["drives","drives",""],
-    ["clusters_resolved","clusters resolved",""],
   ];
   $("#ovGrid").innerHTML = cards.map(([k,l,c,fn])=>`
     <div class="card"><div class="n ${c}">${fn?fn(o[k]):o[k].toLocaleString()}</div>
     <div class="l">${l}</div></div>`).join("");
-  $("#globalHint").textContent = `${o.clusters_unresolved} in queue`;
+  $("#globalHint").textContent = `${o.clusters_dedup_open} in queue`;
 }
 
 // ---- ingest ----
@@ -352,7 +383,8 @@ $("#ingestAnother").onclick=()=>{
 // ---- review queue ----
 let queue = [], qi = 0, currentCluster = null;
 async function loadQueue(){
-  const r = await api("/api/clusters?include_resolved=false");
+  // dedup kinds only — topic clusters are non-destructive groupings (Projects tab)
+  const r = await api("/api/clusters?include_resolved=false&kinds=exact,doc_version,near_image");
   queue = r.clusters; qi = 0;
   if (!queue.length){ renderEmpty(); return; }
   await renderCluster();
@@ -432,7 +464,85 @@ async function undo(){
   } catch(e){ toast(e.message); }
 }
 async function refreshHint(){
-  try{ const o=await api("/api/overview"); $("#globalHint").textContent=`${o.clusters_unresolved} in queue`; }catch{}
+  try{ const o=await api("/api/overview"); $("#globalHint").textContent=`${o.clusters_dedup_open} in queue`; }catch{}
+}
+
+// ---- projects (topics) ----
+let topicsHealthLoaded=false, tes=null;
+async function loadProjects(){
+  if(!topicsHealthLoaded){
+    topicsHealthLoaded=true;
+    try{
+      const h=await api("/api/topics/health");
+      const sel=$("#topicBackend"); const opts=[];
+      if(h.ollama.available){
+        const n=h.ollama.models.length;
+        opts.push(["ollama",`ollama (${n} model${n===1?'':'s'})`]);
+      }
+      if(h.anthropic.available) opts.push(["anthropic","anthropic (cloud)"]);
+      opts.push(["stub","stub (rule-based, offline)"]);
+      sel.innerHTML=opts.map(([v,l])=>`<option value="${v}">${esc(l)}</option>`).join("");
+      sel.value=h.default;
+      $("#topicBackendNote").textContent = h.ollama.available
+        ? "local model — file contents stay on this machine"
+        : "Ollama not detected — stub uses each doc's title heading, no model needed";
+    }catch(e){ /* keep whatever the select has */ }
+  }
+  await renderProjects();
+}
+async function renderProjects(){
+  const cs=(await api("/api/clusters?kinds=topic&include_resolved=true")).clusters;
+  $("#projMeta").textContent = cs.length ? `${cs.length} project group(s)` : "no topics yet";
+  if(!cs.length){
+    $("#projBody").innerHTML=`<div class="empty">No topic groups yet.<br>
+      <span class="hint">Click <b>Infer topics</b> — it reads each document's first page and groups files by subject.</span></div>`;
+    return;
+  }
+  $("#projBody").innerHTML=cs.map(c=>`
+    <div class="project" data-cid="${c.id}">
+      <h2>${esc(c.label||"(untitled)")}</h2>
+      <div class="sub">${c.n_members} file(s) · click to expand ▾</div>
+      <div class="files"><span class="hint">loading…</span></div>
+    </div>`).join("");
+  document.querySelectorAll(".project").forEach(el=>{
+    el.querySelector(".sub").onclick=()=>toggleProject(el);
+  });
+}
+async function toggleProject(el){
+  const open=el.classList.toggle("open");
+  if(open && !el.dataset.loaded){
+    el.dataset.loaded="1";
+    const c=await api("/api/clusters/"+el.dataset.cid);
+    el.querySelector(".files").innerHTML = c.paths.map(p=>`
+      <div class="frow">${esc(p.path)}
+        <div class="drive">drive ${p.drive_id.slice(0,8)} · ${fmtBytes(p.size)}`+
+        `${p.status==='purgatory'?' · <span class="badge purg">purgatory</span>':''}</div>
+      </div>`).join("");
+  }
+}
+$("#inferBtn").onclick=startInfer;
+function startInfer(){
+  const backend=$("#topicBackend").value;
+  const btn=$("#inferBtn"); btn.disabled=true;
+  const st=$("#topicStatus"); st.style.display="block"; st.textContent="starting…";
+  tes=new EventSource(`/api/topics/stream?backend=${encodeURIComponent(backend)}`);
+  tes.onmessage=ev=>{
+    const m=JSON.parse(ev.data);
+    if(m.kind==="started") st.textContent=`tagging ${m.total} document(s) with ${m.backend}…`;
+    else if(m.kind==="progress") st.textContent=`[${m.i}/${m.total}] ${m.path}${m.topic?" → "+m.topic:""}`;
+    else if(m.kind==="error" && !m.fatal){ /* per-file hiccup — tallied in the done summary */ }
+    else if(m.kind==="done"){ tes.close(); tes=null; inferDone(m); }
+    else if(m.kind==="error"){ tes.close(); tes=null; st.textContent="error: "+m.error; btn.disabled=false; }
+  };
+  tes.onerror=()=>{ if(tes){ tes.close(); tes=null; st.textContent="error: connection lost"; btn.disabled=false; } };
+}
+async function inferDone(m){
+  $("#topicStatus").textContent=
+    `done — tagged ${m.tagged}, skipped ${m.skipped}, ${m.errors} error(s) · `+
+    `+${m.topic_clusters} new project group(s)`;
+  $("#inferBtn").disabled=false;
+  await renderProjects(); refreshHint();
+  toast("topics inferred");
 }
 
 // ---- search ----

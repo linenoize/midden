@@ -22,7 +22,7 @@ from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from . import near
+from . import near, topics
 from .ingest import ingest as run_ingest
 from .store import Store
 
@@ -40,8 +40,10 @@ def create_app(db_path: Path) -> FastAPI:
     n_exact = store.materialize_exact_clusters()
     n_doc = near.materialize_doc_versions(store)
     n_img = near.materialize_near_images(store)
+    n_topic = topics.materialize_topics(store)  # from persisted topic tags, if any
     app.state.store = store
-    app.state.bootstrap = {"exact": n_exact, "doc_version": n_doc, "near_image": n_img}
+    app.state.bootstrap = {"exact": n_exact, "doc_version": n_doc,
+                           "near_image": n_img, "topic": n_topic}
 
     @app.get("/api/overview")
     def overview() -> dict:
@@ -55,8 +57,12 @@ def create_app(db_path: Path) -> FastAPI:
         return {**result, **store.overview()}
 
     @app.get("/api/clusters")
-    def clusters(include_resolved: bool = False) -> dict:
-        return {"clusters": store.list_clusters(include_resolved=include_resolved)}
+    def clusters(include_resolved: bool = False, kinds: str = "") -> dict:
+        # `kinds`: optional comma-separated filter. The review queue passes the
+        # dedup kinds; the Projects view passes "topic". Empty = all kinds.
+        kind_tuple = tuple(k for k in kinds.split(",") if k) or None
+        return {"clusters": store.list_clusters(
+            include_resolved=include_resolved, kinds=kind_tuple)}
 
     @app.get("/api/clusters/{cluster_id}")
     def cluster(cluster_id: int) -> dict:
@@ -194,6 +200,53 @@ def create_app(db_path: Path) -> FastAPI:
 
         return StreamingResponse(gen(), media_type="text/event-stream")
 
+    @app.get("/api/topics/health")
+    def topics_health() -> dict:
+        """Which inference backends are usable right now (drives the UI picker)."""
+        ok, models = topics.ollama_available()
+        return {
+            "ollama": {"available": ok, "models": models},
+            "anthropic": {"available": topics.anthropic_available()},
+            "stub": {"available": True},
+            "default": topics.resolve_backend("auto"),
+        }
+
+    @app.get("/api/topics/stream")
+    def topics_stream(backend: str = "auto", model: str = "", limit: int = 0):
+        """Infer topics over untagged docs, streaming progress as SSE.
+
+        Dedicated Store connection (the inference loop is slow — seconds/doc on
+        local models — and must not hold the request-thread connection). On
+        completion it materializes topic clusters and emits the fresh overview.
+        """
+        resolved = topics.resolve_backend(backend)
+
+        def sse(obj: dict) -> str:
+            return f"data: {json.dumps(obj)}\n\n"
+
+        def gen():
+            job = Store(db_path, same_thread=False)
+            try:
+                for ev in topics.compute_topics(
+                    job, backend=resolved,
+                    model=model or None, limit=limit or None,
+                ):
+                    if ev["kind"] == "tagged_done":
+                        n_clusters = topics.materialize_topics(job)
+                        yield sse({"kind": "done", "backend": resolved,
+                                   "tagged": ev["tagged"], "skipped": ev["skipped"],
+                                   "errors": ev["errors"],
+                                   "topic_clusters": n_clusters,
+                                   "overview": job.overview()})
+                    else:
+                        yield sse(ev)
+            except Exception as e:  # noqa: BLE001 — surface anything to the client
+                yield sse({"kind": "error", "fatal": True, "error": str(e)})
+            finally:
+                job.close()
+
+        return StreamingResponse(gen(), media_type="text/event-stream")
+
     @app.get("/")
     def index() -> FileResponse:
         return FileResponse(UI_DIR / "index.html")
@@ -211,7 +264,8 @@ def serve(db_path: Path, host: str = "127.0.0.1", port: int = 8000) -> None:
     b = app.state.bootstrap
     print(f"[midden] serving {db_path}")
     print(f"[midden] materialized on boot: exact +{b['exact']}, "
-          f"doc_version +{b['doc_version']}, near_image +{b['near_image']}")
+          f"doc_version +{b['doc_version']}, near_image +{b['near_image']}, "
+          f"topic +{b['topic']}")
     print(f"[midden] ingest a folder from the UI (Ingest tab) or `python -m midden.cli ingest <dir>`")
     print(f"[midden] open http://{host}:{port}/")
     uvicorn.run(app, host=host, port=port, log_level="warning")
