@@ -93,19 +93,36 @@ CREATE TABLE IF NOT EXISTS decisions (
 
 class Store:
     def __init__(self, db_path: Path, same_thread: bool = True):
-        # same_thread=False is used by the FastAPI server (sync handlers run in a
-        # threadpool); single-user, so we serialize writes with self._lock.
+        # The FastAPI server (same_thread=False) runs sync handlers in a
+        # threadpool. A single sqlite3.Connection is NOT safe for concurrent use
+        # across threads, so each thread gets its OWN connection via a
+        # threading.local (see the `conn` property). WAL mode lets those
+        # connections read concurrently with a single writer; we still serialize
+        # *writers* with self._lock so two threads never collide on the write.
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        self.conn = sqlite3.connect(
-            self.db_path, isolation_level=None, check_same_thread=same_thread
-        )
-        self.conn.execute("PRAGMA journal_mode=WAL")
-        self.conn.execute("PRAGMA synchronous=NORMAL")
-        self.conn.execute("PRAGMA foreign_keys=ON")
-        self.conn.row_factory = sqlite3.Row
+        self._same_thread = same_thread
+        self._local = threading.local()
         self._lock = threading.RLock()
         self._init_schema()
+
+    def _connect(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(
+            self.db_path, isolation_level=None, check_same_thread=self._same_thread
+        )
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        conn.execute("PRAGMA foreign_keys=ON")
+        conn.execute("PRAGMA busy_timeout=5000")  # wait out a concurrent writer
+        conn.row_factory = sqlite3.Row
+        return conn
+
+    @property
+    def conn(self) -> sqlite3.Connection:
+        c = getattr(self._local, "conn", None)
+        if c is None:
+            c = self._local.conn = self._connect()
+        return c
 
     def _init_schema(self) -> None:
         self.conn.executescript(SCHEMA)
@@ -724,4 +741,9 @@ class Store:
         return [dict(r) for r in rows]
 
     def close(self) -> None:
-        self.conn.close()
+        # Closes the calling thread's connection. Other threads' connections are
+        # released when the process exits (server connections are process-lived).
+        c = getattr(self._local, "conn", None)
+        if c is not None:
+            c.close()
+            self._local.conn = None
