@@ -423,7 +423,7 @@ async function renderCluster(){
       : `<div class="drive">drive ${p.drive_id.slice(0,8)}</div>`;
     return `<div class="p ${p.status==='purgatory'?'purged':''}" data-pid="${p.id}" data-keep="${p.status==='active'}">
       <div class="idx">${activeIdx??"·"}</div>
-      <div><div class="path">${p.path}</div>${meta}</div>
+      <div><div class="path">${esc(p.path)}</div>${meta}</div>
       <div class="spacer" style="flex:1"></div>${badge}</div>`;
   }).join("");
   const sub = multi
@@ -557,7 +557,7 @@ async function runSearch(){
   if(!r.results.length){ $("#searchBody").innerHTML=`<p class="hint">No matches.</p>`; return; }
   $("#searchBody").innerHTML=`<table><thead><tr>
     <th>path</th><th>drive</th><th>size</th><th>status</th></tr></thead><tbody>${
-    r.results.map(x=>`<tr><td class="path">${x.path}</td>
+    r.results.map(x=>`<tr><td class="path">${esc(x.path)}</td>
       <td>${x.drive_id.slice(0,8)}</td><td>${fmtBytes(x.size)}</td>
       <td>${x.status==='purgatory'?'<span class="badge purg">purgatory</span>':'active'}</td></tr>`).join("")
   }</tbody></table><p class="hint" style="margin-top:10px">${r.results.length} result(s)</p>`;
@@ -575,7 +575,7 @@ async function loadPurgatory(){
   $("#purgBody").innerHTML = `<table><thead><tr>
     <th>path</th><th>drive</th><th>size</th><th></th></tr></thead><tbody>${
     r.items.map(x=>`<tr>
-      <td class="path">${x.path}</td>
+      <td class="path">${esc(x.path)}</td>
       <td>${x.drive_id.slice(0,8)}</td>
       <td>${fmtBytes(x.size)}</td>
       <td><button class="act" data-restore="${x.id}">restore</button></td>

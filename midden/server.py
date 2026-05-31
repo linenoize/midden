@@ -16,9 +16,10 @@ import json
 import string
 import time
 from pathlib import Path
+from urllib.parse import urlparse
 
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
@@ -27,6 +28,10 @@ from .ingest import ingest as run_ingest
 from .store import Store
 
 UI_DIR = Path(__file__).parent / "ui"
+
+# Hosts a same-origin request to a loopback-bound server can legitimately carry.
+LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
+_MUTATING_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
 
 
 class KeepBody(BaseModel):
@@ -44,6 +49,25 @@ def create_app(db_path: Path) -> FastAPI:
     app.state.store = store
     app.state.bootstrap = {"exact": n_exact, "doc_version": n_doc,
                            "near_image": n_img, "topic": n_topic}
+
+    @app.middleware("http")
+    async def csrf_guard(request: Request, call_next):
+        """Reject cross-origin state-changing requests.
+
+        Several mutation endpoints are bodyless POSTs (purge_all, undo, restore,
+        recluster), which browsers treat as "simple" requests — no CORS preflight
+        — so any web page the user has open could fire them at the loopback
+        server. We block any mutating request whose Origin is not a loopback host.
+        Requests with no Origin (CLI/tests/curl) are allowed.
+        """
+        if request.method in _MUTATING_METHODS:
+            origin = request.headers.get("origin")
+            if origin:
+                host = (urlparse(origin).hostname or "").strip("[]")
+                if host not in LOOPBACK_HOSTS:
+                    return JSONResponse(
+                        {"detail": "cross-origin request refused"}, status_code=403)
+        return await call_next(request)
 
     @app.get("/api/overview")
     def overview() -> dict:
@@ -257,8 +281,20 @@ def create_app(db_path: Path) -> FastAPI:
     return app
 
 
-def serve(db_path: Path, host: str = "127.0.0.1", port: int = 8000) -> None:
+def serve(db_path: Path, host: str = "127.0.0.1", port: int = 8000,
+          allow_remote: bool = False) -> None:
     import uvicorn
+
+    # The folder picker (/api/dirs) lists the server's filesystem and the ingest
+    # stream (/api/ingest/stream?path=) walks/hashes any server path — both
+    # unauthenticated. That's acceptable on loopback (single-user) but a remote
+    # exposure on any other interface. Refuse unless the operator opts in.
+    if host not in LOOPBACK_HOSTS and not allow_remote:
+        raise SystemExit(
+            f"[midden] refusing to bind {host}: /api/dirs and /api/ingest expose "
+            f"the server's filesystem with no auth. Use --host 127.0.0.1, or pass "
+            f"--allow-remote if you really intend to serve a non-loopback interface."
+        )
 
     app = create_app(db_path)
     b = app.state.bootstrap

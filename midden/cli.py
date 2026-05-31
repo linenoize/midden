@@ -149,7 +149,7 @@ def cmd_topics(args) -> int:
 
 def cmd_serve(args) -> int:
     from .server import serve
-    serve(args.db, host=args.host, port=args.port)
+    serve(args.db, host=args.host, port=args.port, allow_remote=args.allow_remote)
     return 0
 
 
@@ -188,6 +188,9 @@ def main(argv=None) -> int:
     p_srv = sub.add_parser("serve", help="run the cluster-review web UI")
     p_srv.add_argument("--host", default="127.0.0.1")
     p_srv.add_argument("--port", type=int, default=8000)
+    p_srv.add_argument("--allow-remote", action="store_true",
+                       help="permit binding a non-loopback host (exposes the "
+                            "filesystem picker + ingest with no auth — unsafe)")
     p_srv.set_defaults(func=cmd_serve)
 
     args = ap.parse_args(argv)
