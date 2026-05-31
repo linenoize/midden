@@ -13,6 +13,7 @@ from __future__ import annotations
 import hashlib
 import mimetypes
 import os
+import stat
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -33,6 +34,27 @@ except ImportError:
 
     def _new_hasher():
         return hashlib.sha256()
+
+
+_FILE_ATTRIBUTE_REPARSE_POINT = 0x400  # Windows junctions / mount points
+
+
+def is_reparse_point(p: Path) -> bool:
+    """True if `p` is a symlink or (Windows) a junction / reparse point.
+
+    `Path.is_symlink()` returns False for Windows directory junctions, so
+    `os.walk(followlinks=False)` would still descend into them. We additionally
+    check the reparse-point attribute (design D7: never traverse these). Uses
+    `os.lstat` so we inspect the link/junction itself, not its target.
+    """
+    try:
+        st = os.lstat(p)
+    except OSError:
+        return False
+    if stat.S_ISLNK(st.st_mode):
+        return True
+    # st_file_attributes exists only on Windows; 0 elsewhere -> False.
+    return bool(getattr(st, "st_file_attributes", 0) & _FILE_ATTRIBUTE_REPARSE_POINT)
 
 
 def hash_file(path: Path, chunk_size: int = 1024 * 1024) -> str:
@@ -87,14 +109,29 @@ def ingest(
     yield IngestEvent(kind="started", path=str(root))
 
     for dirpath, dirnames, filenames in os.walk(root, followlinks=follow_symlinks):
+        if not follow_symlinks:
+            # Prune directory symlinks AND Windows junctions/reparse points in
+            # place so os.walk never descends into them. os.walk(followlinks=
+            # False) already skips true symlinked dirs, but junctions are NOT
+            # symlinks on Windows, so it would otherwise follow them (cycles +
+            # double-ingest of the same content under two paths).
+            kept = []
+            for d in dirnames:
+                dpath = Path(dirpath) / d
+                if is_reparse_point(dpath):
+                    stats.files_skipped_symlink += 1
+                    yield IngestEvent(kind="skipped_symlink", path=str(dpath))
+                else:
+                    kept.append(d)
+            dirnames[:] = kept
         for name in filenames:
             if name in skip_names:
                 continue
             stats.files_seen += 1
             full = Path(dirpath) / name
             try:
-                # symlinks: skip unless explicitly enabled
-                if full.is_symlink() and not follow_symlinks:
+                # symlinks / reparse points: skip unless explicitly enabled
+                if not follow_symlinks and is_reparse_point(full):
                     stats.files_skipped_symlink += 1
                     yield IngestEvent(kind="skipped_symlink", path=str(full))
                     continue
