@@ -12,14 +12,18 @@ cheap and does no disk I/O over the corpus.
 """
 from __future__ import annotations
 
+import json
+import string
+import time
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from . import near
+from .ingest import ingest as run_ingest
 from .store import Store
 
 UI_DIR = Path(__file__).parent / "ui"
@@ -97,6 +101,99 @@ def create_app(db_path: Path) -> FastAPI:
         except ValueError as e:
             raise HTTPException(400, str(e))
 
+    @app.get("/api/dirs")
+    def dirs(path: str = "") -> dict:
+        """Read-only directory listing for the folder picker.
+
+        Empty `path` -> the list of existing drive roots (Windows) or `/` (POSIX).
+        Returns sub-directories only; symlinks/junctions are skipped (same policy
+        as ingest). `parent` is null at the drive-list level, "" at a drive root
+        (so "up" returns to the drive list), else the parent path.
+        """
+        if not path:
+            roots = []
+            for d in string.ascii_uppercase:
+                r = Path(f"{d}:\\")
+                if r.exists():
+                    roots.append({"name": f"{d}:\\", "path": str(r)})
+            if not roots:  # POSIX
+                roots.append({"name": "/", "path": "/"})
+            return {"path": "", "parent": None, "dirs": roots}
+
+        p = Path(path)
+        if not p.is_dir():
+            raise HTTPException(400, f"Not a directory: {path}")
+        subdirs = []
+        try:
+            children = sorted(p.iterdir(), key=lambda c: c.name.lower())
+        except PermissionError:
+            raise HTTPException(403, f"Permission denied: {path}")
+        for child in children:
+            try:
+                if child.is_dir() and not child.is_symlink():
+                    subdirs.append({"name": child.name, "path": str(child)})
+            except OSError:
+                continue  # unreadable entry — skip, don't fail the listing
+        parent = "" if p.parent == p else str(p.parent)
+        return {"path": str(p), "parent": parent, "dirs": subdirs}
+
+    @app.get("/api/ingest/stream")
+    def ingest_stream(path: str, label: str = ""):
+        """Run ingest over `path`, streaming progress as Server-Sent Events.
+
+        Uses a dedicated Store (its own connection) so the long-running walk never
+        shares the request-thread connection. On completion it materializes exact
+        clusters (cheap) and emits the fresh overview; near-dup signatures are left
+        to the explicit `/api/recluster` (they re-read every file).
+        """
+        root = Path(path)
+
+        def sse(obj: dict) -> str:
+            return f"data: {json.dumps(obj)}\n\n"
+
+        def gen():
+            job = Store(db_path, same_thread=False)
+            n_hashed = n_skipped = n_err = n_symlink = 0
+            bytes_hashed = 0
+            last = 0.0
+            try:
+                for ev in run_ingest(root, job, label=label or None):
+                    if ev.kind == "started":
+                        yield sse({"kind": "started", "path": ev.path})
+                    elif ev.kind == "hashed":
+                        n_hashed += 1
+                        bytes_hashed += ev.size
+                        now = time.time()
+                        if now - last > 0.1:  # throttle: at most ~10 frames/sec
+                            last = now
+                            yield sse({"kind": "progress", "hashed": n_hashed,
+                                       "skipped": n_skipped, "errors": n_err,
+                                       "bytes": bytes_hashed, "path": ev.path})
+                    elif ev.kind == "skipped":
+                        n_skipped += 1
+                    elif ev.kind == "skipped_symlink":
+                        n_symlink += 1
+                    elif ev.kind == "error":
+                        n_err += 1
+                        yield sse({"kind": "file_error", "path": ev.path,
+                                   "error": ev.error})
+                    elif ev.kind == "done":
+                        n_clusters = job.materialize_exact_clusters()
+                        yield sse({"kind": "done", "hashed": n_hashed,
+                                   "skipped": n_skipped, "symlinks": n_symlink,
+                                   "errors": n_err, "bytes": bytes_hashed,
+                                   "elapsed": ev.elapsed,
+                                   "exact_clusters": n_clusters,
+                                   "overview": job.overview()})
+            except ValueError as e:  # not-a-directory etc. from ingest()
+                yield sse({"kind": "error", "error": str(e)})
+            except Exception as e:  # noqa: BLE001 — surface anything to the client
+                yield sse({"kind": "error", "error": str(e)})
+            finally:
+                job.close()
+
+        return StreamingResponse(gen(), media_type="text/event-stream")
+
     @app.get("/")
     def index() -> FileResponse:
         return FileResponse(UI_DIR / "index.html")
@@ -115,6 +212,6 @@ def serve(db_path: Path, host: str = "127.0.0.1", port: int = 8000) -> None:
     print(f"[midden] serving {db_path}")
     print(f"[midden] materialized on boot: exact +{b['exact']}, "
           f"doc_version +{b['doc_version']}, near_image +{b['near_image']}")
-    print(f"[midden] (run `python -m midden.cli cluster` first to compute near-dup signatures)")
+    print(f"[midden] ingest a folder from the UI (Ingest tab) or `python -m midden.cli ingest <dir>`")
     print(f"[midden] open http://{host}:{port}/")
     uvicorn.run(app, host=host, port=port, log_level="warning")

@@ -91,6 +91,29 @@
   th,td { text-align:left; padding:7px 10px; border-bottom:1px solid var(--line); font-size:12px; }
   th { color:var(--dim); font-weight:500; }
   td.path { word-break:break-all; }
+  /* ingest */
+  .picker { border:1px solid var(--line); border-radius:10px; background:var(--panel); margin:14px 0; }
+  .picker-bar { display:flex; gap:12px; align-items:center; padding:10px 12px; border-bottom:1px solid var(--line); }
+  .picker-bar .here { flex:1; word-break:break-all; color:var(--ink); }
+  .dirlist { max-height:340px; overflow:auto; }
+  .dirrow {
+    display:flex; align-items:center; gap:10px; padding:8px 12px; cursor:pointer;
+    border-bottom:1px solid var(--line);
+  }
+  .dirrow:last-child { border-bottom:none; }
+  .dirrow:hover { background:var(--panel2); }
+  .dirrow .ic { color:var(--accent); width:14px; }
+  .dirrow.muted { cursor:default; color:var(--dim); }
+  .dirrow.muted:hover { background:transparent; }
+  .ingest-form { display:flex; gap:10px; margin-top:14px; flex-wrap:wrap; align-items:center; }
+  .ingest-form input {
+    background:var(--panel); border:1px solid var(--line); color:var(--ink);
+    padding:10px 12px; border-radius:8px; font:inherit;
+  }
+  .ingest-form #ingestPath { flex:1; min-width:240px; color:var(--dim); }
+  #ipStatus { margin:14px 0; color:var(--dim); min-height:1.4em; word-break:break-all; }
+  #ingestActions { display:none; gap:8px; flex-wrap:wrap; margin-top:16px; }
+  code { background:#0d0f15; border:1px solid var(--line); border-radius:4px; padding:0 4px; font-size:12px; }
   .toast {
     position:fixed; bottom:20px; left:50%; transform:translateX(-50%);
     background:var(--panel); border:1px solid var(--line); padding:10px 16px;
@@ -104,6 +127,7 @@
   <h1>midden <span>· cluster review</span></h1>
   <nav>
     <button data-view="overview" class="active">Overview</button>
+    <button data-view="ingest">Ingest</button>
     <button data-view="review">Review</button>
     <button data-view="search">Search</button>
     <button data-view="purgatory">Purgatory</button>
@@ -119,6 +143,43 @@
       Press <kbd>Review</kbd> (or the tab) to triage the queue. Everything is reversible —
       "purgatory" hides copies from default views but never deletes.
     </p>
+  </section>
+
+  <section class="view" id="view-ingest">
+    <div id="ingestStart">
+      <p class="hint">
+        Pick a folder to index. Ingest is <b>read-only</b> — your originals are never modified
+        (only a tiny <code>.midden_drive.json</code> marker is written at the folder root, once).
+        Symlinks and junctions are skipped; re-ingesting the same folder is cheap and idempotent.
+      </p>
+      <div class="picker">
+        <div class="picker-bar">
+          <button class="act" id="dirUp">↑ up</button>
+          <span class="here" id="dirHere">—</span>
+        </div>
+        <div class="dirlist" id="dirList"></div>
+      </div>
+      <div class="ingest-form">
+        <input type="text" id="ingestPath" placeholder="navigate into the folder you want to index…" readonly />
+        <input type="text" id="ingestLabel" placeholder="label (optional)" />
+        <button class="act" id="ingestGo" disabled>Start ingest</button>
+      </div>
+    </div>
+
+    <div id="ingestProgress" style="display:none">
+      <div class="grid">
+        <div class="card"><div class="n accent" id="ipHashed">0</div><div class="l">files hashed</div></div>
+        <div class="card"><div class="n" id="ipSkipped">0</div><div class="l">skipped (unchanged)</div></div>
+        <div class="card"><div class="n good" id="ipBytes">0 B</div><div class="l">bytes hashed</div></div>
+        <div class="card"><div class="n warn" id="ipErrors">0</div><div class="l">errors</div></div>
+      </div>
+      <p id="ipStatus">starting…</p>
+      <div id="ingestActions">
+        <button class="act" id="reclusterBtn">Find near-duplicates (recluster)</button>
+        <button class="act" id="gotoReview">Go to Review</button>
+        <button class="act" id="ingestAnother">Ingest another folder</button>
+      </div>
+    </div>
   </section>
 
   <section class="view" id="view-review">
@@ -177,6 +238,7 @@ const showView = v => {
   document.querySelectorAll("nav button").forEach(b=>b.classList.toggle("active",b.dataset.view===v));
   document.querySelectorAll(".view").forEach(s=>s.classList.toggle("active",s.id==="view-"+v));
   if (v==="overview") loadOverview();
+  if (v==="ingest" && !ingestInit){ ingestInit=true; loadDirs(""); }
   if (v==="review") loadQueue();
   if (v==="search") $("#q").focus();
   if (v==="purgatory") loadPurgatory();
@@ -201,6 +263,91 @@ async function loadOverview(){
     <div class="l">${l}</div></div>`).join("");
   $("#globalHint").textContent = `${o.clusters_unresolved} in queue`;
 }
+
+// ---- ingest ----
+let ingestInit=false, dirParent=null, chosenDir=null, es=null;
+const esc = s => s.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;");
+async function loadDirs(path){
+  let r;
+  try { r = await api("/api/dirs?path="+encodeURIComponent(path||"")); }
+  catch(e){ toast(e.message); return; }
+  dirParent = r.parent;
+  $("#dirHere").textContent = r.path || "This PC — pick a drive";
+  $("#dirUp").style.visibility = (r.parent===null) ? "hidden" : "visible";
+  if (r.path){                       // inside a real folder → it's selectable
+    chosenDir = r.path; $("#ingestPath").value = r.path; $("#ingestGo").disabled = false;
+  } else {                           // drive list → nothing selected yet
+    chosenDir = null; $("#ingestPath").value = ""; $("#ingestGo").disabled = true;
+  }
+  $("#dirList").innerHTML = r.dirs.length
+    ? r.dirs.map(d=>`<div class="dirrow" data-path="${esc(d.path)}">
+        <span class="ic">▸</span><span>${esc(d.name)}</span></div>`).join("")
+    : `<div class="dirrow muted">— no sub-folders —</div>`;
+  document.querySelectorAll("#dirList .dirrow[data-path]").forEach(el=>{
+    el.onclick=()=>loadDirs(el.dataset.path);
+  });
+}
+$("#dirUp").onclick=()=>{ if(dirParent!==null) loadDirs(dirParent); };
+$("#ingestGo").onclick=startIngest;
+
+function setProg(m){
+  $("#ipHashed").textContent=(m.hashed||0).toLocaleString();
+  $("#ipSkipped").textContent=(m.skipped||0).toLocaleString();
+  $("#ipErrors").textContent=(m.errors||0).toLocaleString();
+  $("#ipBytes").textContent=fmtBytes(m.bytes||0);
+}
+function startIngest(){
+  if(!chosenDir) return;
+  const label=$("#ingestLabel").value.trim();
+  $("#ingestStart").style.display="none";
+  $("#ingestProgress").style.display="block";
+  $("#ingestActions").style.display="none";
+  setProg({}); $("#ipStatus").textContent="starting…";
+  const url=`/api/ingest/stream?path=${encodeURIComponent(chosenDir)}&label=${encodeURIComponent(label)}`;
+  es=new EventSource(url);
+  es.onmessage=ev=>{
+    const m=JSON.parse(ev.data);
+    if(m.kind==="started") $("#ipStatus").textContent="walking "+m.path;
+    else if(m.kind==="progress"){ setProg(m); $("#ipStatus").textContent="hashing · "+(m.path||""); }
+    else if(m.kind==="file_error"){ /* tallied into the next progress frame */ }
+    else if(m.kind==="done"){ es.close(); es=null; ingestDone(m); }
+    else if(m.kind==="error"){ es.close(); es=null; ingestError(m.error); }
+  };
+  es.onerror=()=>{ if(es){ es.close(); es=null; ingestError("connection lost"); } };
+}
+function ingestDone(m){
+  setProg(m);
+  $("#ipStatus").textContent =
+    `done — hashed ${m.hashed}, skipped ${m.skipped}, ${m.errors} error(s) in ${m.elapsed.toFixed(1)}s · `+
+    `${m.exact_clusters} exact-dup cluster(s) materialized`;
+  $("#ingestActions").style.display="flex";
+  toast("ingest complete");
+  refreshHint();
+}
+function ingestError(msg){
+  $("#ipStatus").textContent="error: "+msg;
+  $("#ingestActions").style.display="flex";
+}
+$("#reclusterBtn").onclick=async()=>{
+  const btn=$("#reclusterBtn");
+  btn.disabled=true;
+  $("#ipStatus").textContent="computing near-dup signatures… (reads file contents — may take a moment)";
+  try{
+    const r=await api("/api/recluster",{method:"POST"});
+    $("#ipStatus").textContent=
+      `reclustered — doc_version +${r.doc_version_clusters}, near_image +${r.near_image_clusters}; `+
+      `${r.clusters_unresolved} cluster(s) in the review queue`;
+    toast("near-dup clustering done");
+    refreshHint();
+  }catch(e){ $("#ipStatus").textContent="recluster failed: "+e.message; }
+  finally{ btn.disabled=false; }
+};
+$("#gotoReview").onclick=()=>showView("review");
+$("#ingestAnother").onclick=()=>{
+  $("#ingestProgress").style.display="none";
+  $("#ingestStart").style.display="block";
+  loadDirs(chosenDir||"");
+};
 
 // ---- review queue ----
 let queue = [], qi = 0, currentCluster = null;
