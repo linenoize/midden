@@ -9,7 +9,7 @@ description = "Read-only archivist for inherited digital chaos."
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
-authors = [{ name = "Joseph Sorensen", email = "joseph.e.sorensen@gmail.com" }]
+authors = [{ name = "linenoize", email = "linenoize@users.noreply.github.com" }]
 dependencies = []
 
 [project.optional-dependencies]

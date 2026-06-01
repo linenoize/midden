@@ -4,7 +4,7 @@ You're picking up an in-progress MVP. Read this file first; it captures the deci
 
 ## What this is
 
-A read-only archivist for inherited digital chaos. The framing problem: you've inherited a computer (or a stack of drives) from someone who left things disorganized, and you need to make sense of it without destroying anything. See `midden_design.md` for the full design rationale.
+A read-only archivist for inherited digital chaos. The framing problem: you've inherited a computer (or a stack of drives) from someone who left things disorganized, and you need to make sense of it without destroying anything. See `docs/midden_design.md` for the full design rationale.
 
 ## Current state (v0.1)
 
@@ -32,7 +32,7 @@ These were decided up front. If you want to change one, surface it to the user f
 ## Conventions
 
 - **No new dependencies without flagging.** Current deps: `blake3` (optional). About to add: `fastapi`, `uvicorn`, `pillow`, `anthropic`. Anything beyond that, ask first.
-- **Module boundaries** as laid out in `midden_design.md` — one file per concern. Keep `store.py` the only thing that touches the DB schema.
+- **Module boundaries** as laid out in `docs/midden_design.md` — one file per concern. Keep `store.py` the only thing that touches the DB schema.
 - **Yield events from long-running operations** (ingest does this). Lets the CLI and the future web UI both render progress without coupling.
 - **Idempotency everywhere.** Re-running anything should be cheap and safe.
 - **Tests via the synthetic corpus.** Don't bother with unit tests for trivial code; do bother with end-to-end runs against `gen_corpus.py` output + ground-truth JSON.
@@ -90,35 +90,34 @@ python -m midden.cli --db /tmp/midden.sqlite dups
 
 ```
 midden/
-  midden_design.md     # full design rationale — read this if context is missing
   README.md            # user-facing intro
   CLAUDE.md            # this file
+  docs/
+    midden_design.md   # full design rationale — read this if context is missing
+    ROADMAP.md         # where the project is headed
   midden/
     __init__.py
     store.py           # SQLite schema + access (the ONLY thing that touches schema)
     drives.py          # stable drive IDs via .midden_drive.json marker
     ingest.py          # walk + hash + insert; read-only, idempotent; yields events
+    near.py            # near-duplicate clustering orchestration
+    simhash.py         # text simhash fingerprints
+    phash.py           # image perceptual (dHash) fingerprints
+    topics.py          # document topic inference (stub / ollama / anthropic)
+    server.py          # FastAPI server for the review UI
+    ui/index.html      # single-page cluster-review UI
     cli.py             # argparse-based CLI
   tools/
     gen_corpus.py      # synthetic test-corpus generator with ground_truth.json
+    e2e_*.py           # end-to-end test suites
 ```
 
 The user's preferences: concise/direct, no sycophancy, push back when you have a reason. Treat them as a developer — they want substantive technical disagreement, not agreeable execution.
 
-<!-- @Topia-invariants-pointer:start -->
 ## Invariants
 
-Cross-file rules and danger zones live in `.topia/INVARIANTS.md` (consumed by logic-guardian). Highest-risk zones:
+Highest-risk zones — cross-file rules where a careless edit corrupts data:
 - `midden/store.py` — sole owner of the SQLite schema and the `files.status` / `clusters.kind` / `tags.source` vocabularies.
 - `midden/ingest.py` — the read-only boundary; the only sanctioned write to a scanned tree is the `.midden_drive.json` marker.
 - `midden/drives.py` — `MARKER` name is drive identity; changing it orphans every prior ingest.
-<!-- @Topia-invariants-pointer:end -->
-
-<!-- @Topia-context-pointer:start -->
-## Context
-
-Persisted session state lives in `.topia/` (added by `/topia onboard`, 2026-05-29):
-- `conventions.md` — detected code style/idioms · `decisions.md` — the locked architecture decisions · `progress.md` — current state + next steps
-- `contract.md` — enforceable rules · `INVARIANTS.md` — danger zones · `DEVELOPER-GUIDE.md` — human onboarding · `session-log.md`, `instincts.md`
-<!-- @Topia-context-pointer:end -->
 

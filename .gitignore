@@ -1,9 +1,13 @@
+# Python
 __pycache__/
 *.pyc
 *.pyo
 .pytest_cache/
 .venv/
 venv/
+*.egg-info/
+build/
+dist/
 
 # Midden runtime data
 *.sqlite
@@ -13,3 +17,10 @@ venv/
 
 # Synthetic test output
 /tmp_corpus/
+/midden_test/
+
+# Local tooling / agent state — not part of the project
+.claude/
+.topia/
+.remember/
+AUDIT-REPORT.md
