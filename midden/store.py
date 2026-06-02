@@ -206,10 +206,166 @@ class Store:
         )
 
     def get_path(self, drive_id: str, rel_path: str) -> Optional[sqlite3.Row]:
+        # Join files so the idempotency check (hash + mtime + size) needs ONE
+        # query per already-seen file, not two. This is the hot path on a
+        # resume/re-ingest of a large tree.
         return self.conn.execute(
-            "SELECT hash, mtime FROM paths WHERE drive_id=? AND path=?",
+            """
+            SELECT p.hash AS hash, p.mtime AS mtime, f.size AS size
+            FROM paths p JOIN files f ON f.hash = p.hash
+            WHERE p.drive_id=? AND p.path=?
+            """,
             (drive_id, rel_path),
         ).fetchone()
+
+    def flush_writes(
+        self,
+        file_rows: list[tuple],
+        path_rows: list[tuple],
+    ) -> None:
+        """Apply a batch of file + path upserts in a SINGLE transaction.
+
+        Batching amortizes per-transaction overhead across many files — the
+        difference that matters when ingesting millions of files. Files are
+        written before paths so the paths FK (paths.hash -> files.hash) is
+        satisfied within the transaction. Lock is held only for the write, not
+        for hashing (the caller hashes outside this call).
+
+        file_rows: (hash, size, mime, now)
+        path_rows: (hash, drive_id, path, mtime, ctime, now)
+        """
+        if not file_rows and not path_rows:
+            return
+        with self._lock:
+            c = self.conn
+            c.execute("BEGIN")
+            try:
+                if file_rows:
+                    c.executemany(
+                        """
+                        INSERT INTO files(hash, size, mime, first_seen_at)
+                        VALUES (?, ?, ?, ?)
+                        ON CONFLICT(hash) DO UPDATE SET
+                          mime=COALESCE(excluded.mime, files.mime),
+                          size=excluded.size
+                        """,
+                        file_rows,
+                    )
+                if path_rows:
+                    c.executemany(
+                        """
+                        INSERT INTO paths(hash, drive_id, path, mtime, ctime, observed_at)
+                        VALUES (?, ?, ?, ?, ?, ?)
+                        ON CONFLICT(drive_id, path) DO UPDATE SET
+                          hash=excluded.hash,
+                          mtime=excluded.mtime,
+                          ctime=excluded.ctime,
+                          observed_at=excluded.observed_at
+                        """,
+                        path_rows,
+                    )
+                c.execute("COMMIT")
+            except Exception:
+                c.execute("ROLLBACK")
+                raise
+
+    # ---------- drives & reconciliation ----------
+    def list_drives(self) -> list[sqlite3.Row]:
+        return self.conn.execute(
+            "SELECT id, label, root_path, last_ingested_at FROM drives ORDER BY label"
+        ).fetchall()
+
+    def get_drive(self, drive_id: str) -> Optional[sqlite3.Row]:
+        return self.conn.execute(
+            "SELECT id, label, root_path, last_ingested_at FROM drives WHERE id=?",
+            (drive_id,),
+        ).fetchone()
+
+    def active_paths_for_drive(self, drive_id: str) -> list[sqlite3.Row]:
+        """Active path observations for a drive, with size (for reconcile)."""
+        return self.conn.execute(
+            """
+            SELECT p.id AS id, p.hash AS hash, p.path AS path,
+                   p.mtime AS mtime, p.ctime AS ctime, f.size AS size
+            FROM paths p JOIN files f ON f.hash = p.hash
+            WHERE p.drive_id=? AND p.status='active'
+            """,
+            (drive_id,),
+        ).fetchall()
+
+    def stale_path_rows(self, drive_id: str, before_ts: int) -> list[sqlite3.Row]:
+        """Active paths for a drive NOT re-observed since `before_ts`.
+
+        Used by `ingest --prune` after a fully-completed walk: any active path
+        whose observed_at predates this run's start was not seen this pass, so
+        the file is gone from disk.
+        """
+        return self.conn.execute(
+            """
+            SELECT p.id AS id, p.hash AS hash, p.path AS path,
+                   p.mtime AS mtime, p.ctime AS ctime, f.size AS size
+            FROM paths p JOIN files f ON f.hash = p.hash
+            WHERE p.drive_id=? AND p.status='active' AND p.observed_at < ?
+            """,
+            (drive_id, before_ts),
+        ).fetchall()
+
+    def delete_paths(
+        self,
+        drive_id: str,
+        rows: list[dict],
+        *,
+        actor: str = "auto",
+        reason: str = "reconcile_delete",
+    ) -> int:
+        """Hard-delete path rows, snapshotting them to `decisions` first.
+
+        The deletion is real (rows leave the `paths` table — no phantom dups),
+        but the decisions snapshot makes it reversible (invariant #7): the
+        payload carries enough to re-INSERT every deleted observation. One
+        transaction so the audit row and the deletes commit together.
+        """
+        if not rows:
+            return 0
+        ids = [r["id"] for r in rows]
+        payload = json.dumps({
+            "drive_id": drive_id,
+            "reason": reason,
+            "paths": [
+                {"path": r["path"], "hash": r["hash"],
+                 "mtime": r["mtime"], "ctime": r["ctime"]}
+                for r in rows
+            ],
+        })
+        now = int(time.time())
+        with self._lock:
+            c = self.conn
+            c.execute("BEGIN")
+            try:
+                c.execute(
+                    "INSERT INTO decisions(ts, actor, action, payload_json) "
+                    "VALUES (?, ?, ?, ?)",
+                    (now, actor, reason, payload),
+                )
+                c.executemany(
+                    "DELETE FROM paths WHERE id=?", [(i,) for i in ids]
+                )
+                c.execute("COMMIT")
+            except Exception:
+                c.execute("ROLLBACK")
+                raise
+        return len(ids)
+
+    def orphan_file_count(self) -> int:
+        """Files with no remaining active path (informational for reconcile)."""
+        return self.conn.execute(
+            """
+            SELECT COUNT(*) FROM files f
+            WHERE NOT EXISTS (
+                SELECT 1 FROM paths p WHERE p.hash=f.hash AND p.status='active'
+            )
+            """
+        ).fetchone()[0]
 
     # ---------- stats ----------
     def stats(self) -> dict:

@@ -22,7 +22,7 @@ These were decided up front. If you want to change one, surface it to the user f
 
 1. **Content-addressed identity.** Files are identified by hash, not path. Paths are observations.
 2. **Read-only ingest.** Never modify originals. Only exception: `.midden_drive.json` marker file at each drive's root (one tiny write per drive, once).
-3. **No deletion, ever.** "Delete" = move to purgatory + hide from default views. Infinite retention default.
+3. **No deletion, ever.** "Delete" = move to purgatory + hide from default views. Infinite retention default. *Exception (decided with the user, 2026-06):* `reconcile` / `ingest --prune` **hard-delete** `paths` rows whose files are gone from disk — these are stale *observations*, not the user's data, and leaving them creates phantom duplicates. Every such delete is snapshotted into the `decisions` table first (so it's reversible per #7), gated behind a real `stat` check, and refuses to run when a drive root is unreachable (unmounted ≠ deleted). `files`/cluster/tag rows are never deleted by reconcile.
 4. **SQLite as the index.** Single file, WAL mode. Good until proven otherwise.
 5. **Cluster-first UX, not folder-first.** The unit of human attention is a cluster (exact dups, version chains, inferred projects). Don't build a folder tree browser as the primary view.
 6. **LLM enrichment is async + additive.** Index works without it. Don't make it a hard dependency.
@@ -99,7 +99,8 @@ midden/
     __init__.py
     store.py           # SQLite schema + access (the ONLY thing that touches schema)
     drives.py          # stable drive IDs via .midden_drive.json marker
-    ingest.py          # walk + hash + insert; read-only, idempotent; yields events
+    ingest.py          # walk + hash + insert; read-only, idempotent; batched writes; yields events
+    reconcile.py       # stat known paths; hard-delete vanished ones (snapshot to decisions); FS boundary
     near.py            # near-duplicate clustering orchestration
     simhash.py         # text simhash fingerprints
     phash.py           # image perceptual (dHash) fingerprints

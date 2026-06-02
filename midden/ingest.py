@@ -57,7 +57,14 @@ def is_reparse_point(p: Path) -> bool:
     return bool(getattr(st, "st_file_attributes", 0) & _FILE_ATTRIBUTE_REPARSE_POINT)
 
 
-def hash_file(path: Path, chunk_size: int = 1024 * 1024) -> str:
+# How many files to buffer before committing one transaction. Amortizes
+# per-transaction overhead across a batch — the lever that matters at millions
+# of files. Hashing happens OUTSIDE the transaction, so a larger batch doesn't
+# lengthen lock hold proportionally.
+BATCH_N = 512
+
+
+def hash_file(path: Path, chunk_size: int = 4 * 1024 * 1024) -> str:
     h = _new_hasher()
     with open(path, "rb") as f:
         while True:
@@ -71,12 +78,13 @@ def hash_file(path: Path, chunk_size: int = 1024 * 1024) -> str:
 # --- events for the CLI/UI to render ---
 @dataclass
 class IngestEvent:
-    kind: str            # 'started' | 'hashed' | 'skipped' | 'skipped_symlink' | 'error' | 'done'
+    kind: str            # 'started'|'hashed'|'skipped'|'skipped_symlink'|'error'|'pruned'|'done'
     path: Optional[str] = None
     hash: Optional[str] = None
     size: int = 0
     error: Optional[str] = None
     elapsed: float = 0.0
+    count: int = 0       # 'pruned': number of vanished paths removed
 
 
 @dataclass
@@ -85,6 +93,7 @@ class IngestStats:
     files_hashed: int = 0
     files_skipped_unchanged: int = 0
     files_skipped_symlink: int = 0
+    files_pruned: int = 0
     bytes_hashed: int = 0
     errors: int = 0
 
@@ -95,8 +104,21 @@ def ingest(
     label: Optional[str] = None,
     follow_symlinks: bool = False,
     skip_names: tuple[str, ...] = (MARKER,),
+    prune: bool = False,
 ) -> Iterator[IngestEvent]:
-    """Walk `root`, ingest into `store`. Yields events. Idempotent."""
+    """Walk `root`, ingest into `store`. Yields events. Idempotent.
+
+    Resume: re-running is cheap. Files whose (mtime, size) match an existing
+    record are not re-hashed, so an interrupted run picks up where it left off
+    just by being re-invoked — the already-hashed files fall through the skip
+    path. Writes are batched (BATCH_N per transaction).
+
+    prune: after a FULLY completed walk, hard-delete active paths that were not
+    re-observed this run (i.e. gone from disk). Off by default and only safe on
+    a complete pass — never enable it for a partial/aborted scan, or unscanned
+    files would be deleted from the index. The standalone `reconcile` command is
+    the safer route (it stat-checks rather than trusting walk completeness).
+    """
     root = Path(root).resolve()
     if not root.exists() or not root.is_dir():
         raise ValueError(f"Not a directory: {root}")
@@ -106,7 +128,18 @@ def ingest(
 
     stats = IngestStats()
     started = time.time()
+    run_started = int(started)  # epoch boundary for --prune (observed_at < this)
     yield IngestEvent(kind="started", path=str(root))
+
+    # Batched-write buffers; flushed every BATCH_N files and once at the end.
+    file_buf: list[tuple] = []
+    path_buf: list[tuple] = []
+
+    def flush() -> None:
+        if file_buf or path_buf:
+            store.flush_writes(file_buf, path_buf)
+            file_buf.clear()
+            path_buf.clear()
 
     for dirpath, dirnames, filenames in os.walk(root, followlinks=follow_symlinks):
         if not follow_symlinks:
@@ -140,42 +173,58 @@ def ingest(
                 size = st.st_size
                 mtime = int(st.st_mtime)
                 ctime = int(st.st_ctime)
+                now = int(time.time())
                 rel = str(full.relative_to(root)).replace("\\", "/")
 
-                # idempotency: skip if (drive_id, path) exists and mtime+size unchanged
-                # (we still re-touch observed_at via upsert_path so we know it's still there)
+                # idempotency / resume: skip if (drive_id, path) exists and both
+                # mtime AND size are unchanged. get_path joins files, so size is
+                # already in hand — no second query on this hot path. We still
+                # re-touch observed_at (buffered) so --prune knows it's present.
                 existing = store.get_path(drive.id, rel)
-                if existing is not None and existing["mtime"] == mtime:
-                    # confirm size matches a record we already hashed
-                    row = store.conn.execute(
-                        "SELECT size FROM files WHERE hash=?",
-                        (existing["hash"],),
-                    ).fetchone()
-                    if row and row["size"] == size:
-                        # still mark the path as observed-just-now
-                        store.upsert_path(existing["hash"], drive.id, rel, mtime, ctime)
-                        stats.files_skipped_unchanged += 1
-                        yield IngestEvent(
-                            kind="skipped",
-                            path=rel,
-                            hash=existing["hash"],
-                            size=size,
-                        )
-                        continue
+                if (
+                    existing is not None
+                    and existing["mtime"] == mtime
+                    and existing["size"] == size
+                ):
+                    path_buf.append(
+                        (existing["hash"], drive.id, rel, mtime, ctime, now)
+                    )
+                    stats.files_skipped_unchanged += 1
+                    yield IngestEvent(
+                        kind="skipped", path=rel, hash=existing["hash"], size=size
+                    )
+                    if len(path_buf) >= BATCH_N:
+                        flush()
+                    continue
 
                 h = hash_file(full)
                 mime, _ = mimetypes.guess_type(full.name)
-                with store.tx():
-                    store.upsert_file(h, size, mime)
-                    store.upsert_path(h, drive.id, rel, mtime, ctime)
+                file_buf.append((h, size, mime, now))
+                path_buf.append((h, drive.id, rel, mtime, ctime, now))
 
                 stats.files_hashed += 1
                 stats.bytes_hashed += size
                 yield IngestEvent(kind="hashed", path=rel, hash=h, size=size)
 
+                if len(path_buf) >= BATCH_N:
+                    flush()
+
             except (PermissionError, OSError) as e:
                 stats.errors += 1
                 yield IngestEvent(kind="error", path=str(full), error=str(e))
+
+    flush()  # commit the tail batch before pruning / finishing
+
+    # --prune: remove paths not re-observed this run. Guarded to a non-empty
+    # completed walk so an empty/unreadable scan can't wipe the drive's index.
+    if prune and stats.files_seen > 0:
+        stale = store.stale_path_rows(drive.id, run_started)
+        if stale:
+            n = store.delete_paths(
+                drive.id, [dict(r) for r in stale], reason="ingest_prune"
+            )
+            stats.files_pruned = n
+            yield IngestEvent(kind="pruned", count=n)
 
     elapsed = time.time() - started
     yield IngestEvent(kind="done", elapsed=elapsed, size=stats.bytes_hashed)
