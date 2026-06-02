@@ -14,6 +14,7 @@ dist/
 *.sqlite-wal
 *.sqlite-shm
 .midden/
+.midden_drive.json
 
 # Synthetic test output
 /tmp_corpus/
