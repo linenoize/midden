@@ -25,17 +25,20 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
 
-      - name: Install (web extra + httpx for TestClient)
+      - name: Install (web extra + httpx for TestClient + Pillow for image suites)
         # Core ingest/index is stdlib-only; the e2e suites drive the FastAPI app
-        # in-process via TestClient, which needs fastapi/uvicorn + httpx. blake3
-        # and pillow stay optional — sha256 and no-Pillow paths degrade cleanly.
+        # in-process via TestClient, which needs fastapi/uvicorn + httpx. Pillow is
+        # installed so the near-image clustering + thumbnail suites exercise the
+        # real perceptual paths (they degrade to a skip without it). blake3 stays
+        # optional — the sha256 fallback path is what CI exercises.
         run: |
           python -m pip install --upgrade pip
-          pip install -e ".[web]" httpx
+          pip install -e ".[web]" httpx pillow
 
       - name: Run e2e suites
         run: |
-          for t in review near purgatory ingest_ui topics; do
+          for t in review near purgatory ingest_ui topics \
+                   shortread near_image repair explain adversarial; do
             echo "::group::e2e_$t"
             python tools/e2e_$t.py
             echo "::endgroup::"

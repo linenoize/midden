@@ -64,21 +64,53 @@ def is_reparse_point(p: Path) -> bool:
 BATCH_N = 512
 
 
-def hash_file(path: Path, chunk_size: int = 4 * 1024 * 1024) -> str:
+class ShortReadError(OSError):
+    """Bytes actually read from a file differ from the size stat() reported.
+
+    A short (or over-) read means partial / placeholder / sparse / racy content.
+    Hashing it would produce a digest of something other than the file's real
+    bytes, which could false-group it as an "exact duplicate". Callers skip and
+    report rather than index a bogus hash. Subclasses OSError so a caller that
+    only cares about "couldn't process this file" still catches it — but ingest
+    handles it explicitly to label it `short_read`.
+    """
+
+    def __init__(self, path, expected: int, got: int):
+        self.path = str(path)
+        self.expected = expected
+        self.got = got
+        super().__init__(
+            f"short read: {path} expected {expected} bytes, read {got}"
+        )
+
+
+def hash_file(
+    path: Path,
+    chunk_size: int = 4 * 1024 * 1024,
+    expected_size: Optional[int] = None,
+) -> str:
+    """Stream-hash `path`. If `expected_size` is given and the bytes actually
+    read differ from it, raise ShortReadError (the read content is not the whole
+    file). `expected_size=None` disables the check (back-compat for diagnostics
+    and tests that hash an arbitrary path)."""
     h = _new_hasher()
+    total = 0
     with open(path, "rb") as f:
         while True:
             chunk = f.read(chunk_size)
             if not chunk:
                 break
             h.update(chunk)
+            total += len(chunk)
+    if expected_size is not None and total != expected_size:
+        raise ShortReadError(path, expected_size, total)
     return h.hexdigest()
 
 
 # --- events for the CLI/UI to render ---
 @dataclass
 class IngestEvent:
-    kind: str            # 'started'|'hashed'|'skipped'|'skipped_symlink'|'error'|'pruned'|'done'
+    kind: str            # 'started'|'hashed'|'skipped'|'skipped_symlink'|'short_read'|'error'|'pruned'|'done'
     path: Optional[str] = None
     hash: Optional[str] = None
     size: int = 0
@@ -93,6 +125,7 @@ class IngestStats:
     files_hashed: int = 0
     files_skipped_unchanged: int = 0
     files_skipped_symlink: int = 0
+    files_short_read: int = 0
     files_pruned: int = 0
     bytes_hashed: int = 0
     errors: int = 0
@@ -197,7 +230,20 @@ def ingest(
                         flush()
                     continue
 
-                h = hash_file(full)
+                # Guard: hash the file and verify we read exactly `size` bytes.
+                # A short/over read (placeholder, sparse, truncated, or a file
+                # being written) yields a hash of partial content that could
+                # false-group as an exact duplicate — skip + report instead of
+                # indexing a bogus digest. ShortReadError subclasses OSError, so
+                # this inner handler MUST precede the outer OSError catch.
+                try:
+                    h = hash_file(full, expected_size=size)
+                except ShortReadError as e:
+                    stats.files_short_read += 1
+                    yield IngestEvent(
+                        kind="short_read", path=rel, size=size, error=str(e)
+                    )
+                    continue
                 mime, _ = mimetypes.guess_type(full.name)
                 file_buf.append((h, size, mime, now))
                 path_buf.append((h, drive.id, rel, mtime, ctime, now))

@@ -35,8 +35,22 @@ ALGO_IMAGE = "phash_image"
 # chain); random cross-document pairs sit at median ~32, p5 ~25. 16 clears the
 # real chains with margin while staying well under the noise floor.
 DOC_VERSION_THRESHOLD = 16   # max SimHash Hamming distance to link two docs
-NEAR_IMAGE_THRESHOLD = 10    # max dHash Hamming distance to link two images
 TEXT_READ_BYTES = 256 * 1024
+
+# Near-image clustering. The old single-linkage all-pairs at Hamming ≤10 chained
+# ~9,581 unrelated images (driven by 771 all-zero "blank" dHashes) into one blob.
+# The fix has four parts:
+#   1. exclude degenerate dHashes (phash.POPCOUNT_MIN/MAX) — blanks aren't "similar".
+#   2. aspect-ratio prior: only images of the same shape are candidates.
+#   3. tight threshold (6, was 10) — precision over recall; a missed near-dup is
+#      cheap, a mega-cluster is not.
+#   4. diameter cap: any component exceeding MAX_NEAR_CLUSTER is dropped, not
+#      surfaced — a clean near-dup set is small.
+# Candidate generation uses LSH banding (not O(n²) all-pairs over 42k images).
+NEAR_IMAGE_THRESHOLD = 6     # max dHash Hamming distance to link two images
+MAX_NEAR_CLUSTER = 200       # components larger than this are dropped + counted
+LSH_BANDS = 8                # 8 bands × 8 bits; threshold < bands ⇒ no missed pairs
+LSH_BUCKET_CAP = 4000        # skip pair-gen for pathologically large LSH buckets
 
 # Version markers stripped to derive a shared stem. NOTE: the digit form REQUIRES
 # a leading 'v' (_v1, _v2). A bare _<number> is NOT treated as a version — doing
@@ -80,20 +94,31 @@ def compute_text_signatures(store: Store) -> int:
     return n
 
 
-def compute_image_signatures(store: Store) -> int:
-    """dHash every active image lacking a signature. Returns # computed (0 if no Pillow)."""
+def compute_image_signatures(store: Store, force_dims_only: bool = False) -> int:
+    """dHash every active image lacking a signature; store the dHash + (w,h).
+
+    Returns # computed (0 if no Pillow). force_dims_only also re-reads images
+    whose signature exists but has no stored dimensions (backfill for DBs signed
+    before dimensions were tracked). Idempotent + resumable: each image commits
+    independently, so an interrupted run resumes by re-invocation.
+    """
     if not phash.PIL_AVAILABLE:
         return 0
     have = store.hashes_with_signature(ALGO_IMAGE)
+    need_dims = store.image_hashes_missing_dims() if force_dims_only else set()
     n = 0
     for f in store.active_files():
-        if f["hash"] in have or not _is_image(f["rel"], f["mime"]):
+        h = f["hash"]
+        if not _is_image(f["rel"], f["mime"]):
+            continue
+        if h in have and not (force_dims_only and h in need_dims):
             continue
         try:
-            sig = phash.dhash(Path(f["abspath"]))
+            sig, w, ht = phash.dhash_with_dims(Path(f["abspath"]))
         except Exception:
             continue
-        store.upsert_signature(f["hash"], ALGO_IMAGE, phash.to_hex(sig))
+        store.upsert_signature(h, ALGO_IMAGE, phash.to_hex(sig))
+        store.upsert_image_dims(h, w, ht)
         n += 1
     return n
 
@@ -162,38 +187,95 @@ def materialize_doc_versions(store: Store, threshold: int = DOC_VERSION_THRESHOL
     return created
 
 
-def materialize_near_images(store: Store, threshold: int = NEAR_IMAGE_THRESHOLD) -> int:
-    """Build near_image clusters from stored perceptual signatures. Idempotent."""
+def _lsh_candidates(items: dict, bands: int = LSH_BANDS) -> set:
+    """Candidate near pairs: those sharing ≥1 identical band. With B bands and a
+    distance threshold T < B, any true pair (Hamming ≤ T) shares ≥ B−T identical
+    bands, so this is a superset of all true pairs (no misses). Avoids O(n²)."""
+    bw = 64 // bands
+    mask = (1 << bw) - 1
+    buckets: dict = {}
+    for h, sig in items.items():
+        for bi in range(bands):
+            bv = (sig >> (bi * bw)) & mask
+            buckets.setdefault((bi, bv), []).append(h)
+    cand: set = set()
+    for hs in buckets.values():
+        if len(hs) < 2 or len(hs) > LSH_BUCKET_CAP:
+            continue  # singleton band, or a pathological low-entropy band — skip
+        for a, b in itertools.combinations(sorted(hs), 2):
+            cand.add((a, b))
+    return cand
+
+
+def materialize_near_images(store: Store, threshold: int = NEAR_IMAGE_THRESHOLD) -> dict:
+    """Build near_image clusters from stored perceptual signatures. Idempotent.
+
+    Degenerate dHashes are excluded; candidates are restricted to the same
+    aspect-ratio bucket and linked only at Hamming ≤ threshold; components larger
+    than MAX_NEAR_CLUSTER are dropped (a clean near-dup set is small). Returns
+    {created, dropped_degenerate, dropped_oversize}.
+    """
+    result = {"created": 0, "dropped_degenerate": 0, "dropped_oversize": 0}
     sigs_hex = store.get_signatures(ALGO_IMAGE)
     if len(sigs_hex) < 2:
-        return 0
-    sigs = {h: phash.from_hex(v) for h, v in sigs_hex.items()}
-    hashes = list(sigs)
-    edges: list[tuple[str, str]] = []
-    # image sets are small and there's no reliable structural prior; all-pairs is fine
-    for a, b in itertools.combinations(hashes, 2):
-        if phash.hamming(sigs[a], sigs[b]) <= threshold:
-            edges.append((a, b))
-    comps = _components(hashes, edges)
-    already = store.clustered_hashes("near_image")
-    created = 0
-    for comp in comps:
-        if comp & already:
+        return result
+    dims = store.get_image_dims()
+
+    # Parse signatures, dropping degenerate (blank / inverted-uniform) hashes.
+    sigs: dict = {}
+    for h, v in sigs_hex.items():
+        s = phash.from_hex(v)
+        pc = bin(s).count("1")
+        if pc < phash.POPCOUNT_MIN or pc > phash.POPCOUNT_MAX:
+            result["dropped_degenerate"] += 1
             continue
-        store.create_cluster("near_image", sorted(comp), label="similar images")
-        created += 1
-    return created
+        sigs[h] = s
+    if len(sigs) < 2:
+        return result
+
+    # Aspect-ratio prior: only same-shape images are clustering candidates.
+    by_aspect: dict = {}
+    for h, s in sigs.items():
+        w, ht = dims.get(h, (None, None))
+        by_aspect.setdefault(phash.aspect_bucket(w, ht), {})[h] = s
+
+    already = store.clustered_hashes("near_image")
+    for bucket_items in by_aspect.values():
+        if len(bucket_items) < 2:
+            continue
+        edges = [
+            (a, b) for a, b in _lsh_candidates(bucket_items)
+            if phash.hamming(bucket_items[a], bucket_items[b]) <= threshold
+        ]
+        for comp in _components(list(bucket_items), edges):
+            if len(comp) > MAX_NEAR_CLUSTER:
+                result["dropped_oversize"] += 1
+                continue
+            if comp & already:
+                continue
+            store.create_cluster("near_image", sorted(comp), label="similar images")
+            result["created"] += 1
+    return result
 
 
-def recluster(store: Store) -> dict:
-    """Full near-dup pass: compute signatures, then materialize near clusters."""
+def recluster(store: Store, reset_near: bool = False,
+              recompute_images: bool = False) -> dict:
+    """Full near-dup pass: compute signatures, then materialize near clusters.
+
+    reset_near: delete existing near_image clusters before rebuilding (repair).
+    recompute_images: re-read images to backfill dimensions on old signatures.
+    """
+    removed = store.reset_clusters("near_image") if reset_near else 0
     n_text_sig = compute_text_signatures(store)
-    n_img_sig = compute_image_signatures(store)
+    n_img_sig = compute_image_signatures(store, force_dims_only=recompute_images)
     n_doc = materialize_doc_versions(store)
-    n_img = materialize_near_images(store)
+    img = materialize_near_images(store)
     return {
         "text_signatures": n_text_sig,
         "image_signatures": n_img_sig,
         "doc_version_clusters": n_doc,
-        "near_image_clusters": n_img,
+        "near_image_clusters": img["created"],
+        "near_image_removed": removed,
+        "dropped_degenerate": img["dropped_degenerate"],
+        "dropped_oversize": img["dropped_oversize"],
     }

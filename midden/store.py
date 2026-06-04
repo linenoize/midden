@@ -15,6 +15,11 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterator, Optional
 
+# Exact-dup groups reclaiming less than this are hidden from the default review
+# queue (still reachable with min_reclaimable=0). Thousands of sub-KB identical
+# configs/icons are technically correct dups but bury the high-value ones.
+EXACT_REVIEW_FLOOR = 1_048_576  # 1 MiB
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS files (
   hash                 TEXT PRIMARY KEY,
@@ -143,6 +148,14 @@ class Store:
             self.conn.execute(
                 "ALTER TABLE clusters ADD COLUMN status TEXT NOT NULL DEFAULT 'open'"
             )
+        # Image dimensions on the perceptual-signature row. Used as an aspect-ratio
+        # structural prior in near-image clustering (dHash discards aspect). Nullable
+        # — pre-existing image signatures backfill on the next signature recompute.
+        sig_cols = {r["name"] for r in self.conn.execute("PRAGMA table_info(signatures)")}
+        if "w" not in sig_cols:
+            self.conn.execute("ALTER TABLE signatures ADD COLUMN w INTEGER")
+        if "h" not in sig_cols:
+            self.conn.execute("ALTER TABLE signatures ADD COLUMN h INTEGER")
 
     @contextmanager
     def tx(self) -> Iterator[sqlite3.Connection]:
@@ -430,6 +443,26 @@ class Store:
         s["topic_clusters"] = c.execute(
             "SELECT COUNT(*) FROM clusters WHERE kind='topic'"
         ).fetchone()[0]
+        # How many open exact groups the default queue hides as low-value (so the
+        # UI can say "N trivially-small duplicate groups hidden").
+        s["exact_review_floor"] = EXACT_REVIEW_FLOOR
+        s["exact_hidden"] = c.execute(
+            """
+            SELECT COUNT(*) FROM (
+              SELECT c.id,
+                COALESCE(SUM(CASE WHEN p.status='active' THEN f.size END),0)
+                - COALESCE(MAX(CASE WHEN p.status='active' THEN f.size END),0) AS recl
+              FROM clusters c
+              JOIN cluster_members cm ON cm.cluster_id=c.id
+              JOIN files f ON f.hash=cm.hash
+              LEFT JOIN paths p ON p.hash=cm.hash
+              WHERE c.kind='exact' AND c.status='open'
+              GROUP BY c.id
+              HAVING COUNT(CASE WHEN p.status='active' THEN 1 END) > 0 AND recl < ?
+            )
+            """,
+            (EXACT_REVIEW_FLOOR,),
+        ).fetchone()[0]
         return s
 
     def exact_duplicate_groups(self, min_size: int = 1) -> list[dict]:
@@ -476,6 +509,44 @@ class Store:
         if active_only:
             q += " AND hash IN (SELECT DISTINCT hash FROM paths WHERE status='active')"
         return {r["hash"]: r["value"] for r in self.conn.execute(q, (algo,))}
+
+    def upsert_image_dims(self, hash_: str, w: int, h: int) -> None:
+        """Attach (width, height) to an existing phash_image signature row."""
+        with self._lock:
+            self.conn.execute(
+                "UPDATE signatures SET w=?, h=? WHERE hash=? AND algo='phash_image'",
+                (w, h, hash_),
+            )
+
+    def get_image_dims(self, active_only: bool = True) -> dict[str, tuple]:
+        """hash -> (w, h) for image signatures. (None, None) where not yet known."""
+        q = "SELECT hash, w, h FROM signatures WHERE algo='phash_image'"
+        if active_only:
+            q += " AND hash IN (SELECT DISTINCT hash FROM paths WHERE status='active')"
+        return {r["hash"]: (r["w"], r["h"]) for r in self.conn.execute(q)}
+
+    def image_hashes_missing_dims(self) -> set:
+        """Image signatures lacking w/h (need a backfill recompute)."""
+        return {r["hash"] for r in self.conn.execute(
+            "SELECT hash FROM signatures WHERE algo='phash_image' AND (w IS NULL OR h IS NULL)")}
+
+    def thumb_source(self, hash_: str) -> Optional[str]:
+        """Absolute path of ONE active location for `hash_`, for thumbnailing.
+        Resolved strictly from the DB (never a client-supplied path)."""
+        r = self.conn.execute(
+            """
+            SELECT d.root_path AS root_path, p.path AS path, f.mime AS mime
+            FROM files f
+            JOIN paths p ON p.hash=f.hash AND p.status='active'
+            JOIN drives d ON d.id=p.drive_id
+            WHERE f.hash=?
+            LIMIT 1
+            """,
+            (hash_,),
+        ).fetchone()
+        if not r:
+            return None
+        return str(Path(r["root_path"]) / r["path"]) if r["root_path"] else r["path"]
 
     # ---------- tags (rule | llm | user) ----------
     def upsert_tag(self, hash_: str, key: str, value: str,
@@ -616,6 +687,33 @@ class Store:
                 )
         return cid
 
+    def reset_clusters(self, kind: str, actor: str = "auto") -> int:
+        """Delete all clusters of `kind` and their members, in one transaction.
+
+        For DERIVED cluster kinds only (near_image / doc_version): these are
+        recomputable groupings, not user data. An audit row is written to
+        `decisions` (invariant #7 spirit) recording how much was removed. Callers
+        must NOT use this on 'exact' (it encodes review state). Returns #clusters
+        removed.
+        """
+        with self._lock:
+            ids = [r["id"] for r in self.conn.execute(
+                "SELECT id FROM clusters WHERE kind=?", (kind,))]
+            if not ids:
+                return 0
+            now = int(time.time())
+            with self.tx():
+                self.conn.execute(
+                    "DELETE FROM cluster_members WHERE cluster_id IN "
+                    "(SELECT id FROM clusters WHERE kind=?)", (kind,))
+                self.conn.execute("DELETE FROM clusters WHERE kind=?", (kind,))
+                self.conn.execute(
+                    "INSERT INTO decisions(ts, actor, action, payload_json) VALUES (?, ?, ?, ?)",
+                    (now, actor, "reset_clusters",
+                     json.dumps({"kind": kind, "removed_clusters": len(ids)})),
+                )
+            return len(ids)
+
     def clustered_hashes(self, kind: str) -> set[str]:
         return {r["hash"] for r in self.conn.execute(
             """
@@ -629,7 +727,8 @@ class Store:
             "SELECT hash FROM cluster_members WHERE cluster_id=?", (cluster_id,))]
 
     def list_clusters(self, include_resolved: bool = False,
-                     kinds: Optional[tuple[str, ...]] = None, limit: int = 500) -> list[dict]:
+                     kinds: Optional[tuple[str, ...]] = None, limit: int = 500,
+                     min_reclaimable: int = 0) -> list[dict]:
         params: list = []
         where = ["1=1"]
         if not include_resolved:
@@ -637,6 +736,13 @@ class Store:
         if kinds:
             where.append("c.kind IN (%s)" % ",".join("?" * len(kinds)))
             params.extend(kinds)
+        # min_reclaimable hides trivially-tiny EXACT groups (e.g. thousands of
+        # sub-KB identical configs) that bury the high-value duplicates. Applied
+        # ONLY to exact clusters — near_image/doc_version aren't size-driven and
+        # must stay visible regardless of reclaimable bytes. 0 = show everything.
+        having = ["n_active > 0"]
+        if min_reclaimable > 0:
+            having.append("(c.kind != 'exact' OR (active_bytes - max_active) >= ?)")
         rows = self.conn.execute(
             f"""
             SELECT c.id AS id, c.kind AS kind, c.label AS label, c.status AS status,
@@ -651,11 +757,11 @@ class Store:
             LEFT JOIN paths p ON p.hash=cm.hash
             WHERE {" AND ".join(where)}
             GROUP BY c.id
-            HAVING n_active > 0
+            HAVING {" AND ".join(having)}
             ORDER BY (active_bytes - max_active) DESC, active_bytes DESC
             LIMIT ?
             """,
-            (*params, limit),
+            (*params, *([min_reclaimable] if min_reclaimable > 0 else []), limit),
         ).fetchall()
         return [
             {
@@ -694,15 +800,59 @@ class Store:
                 flat_paths.append({**p, "hash": h, "size": f["size"] if f else 0})
         actives = [p for p in flat_paths if p["status"] == "active"]
         reclaimable = sum(p["size"] for p in actives) - max((p["size"] for p in actives), default=0)
+        rationale = self._cluster_rationale(row["kind"], members, actives)
         return {
             "id": row["id"], "kind": row["kind"], "label": row["label"],
             "resolved": row["status"] != "open",
             "n_members": len(members),
             "n_active": len(actives),
             "reclaimable": reclaimable,
+            "rationale": rationale,
             "members": members,
             "paths": flat_paths,
         }
+
+    def _cluster_rationale(self, kind: str, members: list, actives: list) -> str:
+        """Human-readable 'why these match' — the trust signal. For exact dups
+        (matched by content, not name) and near images (perceptual distance) a
+        correct match otherwise reads as a bug. Mutates image members in place to
+        attach per-member distance + dimensions."""
+        if kind == "exact":
+            from .ingest import HASH_NAME  # function-level: avoids import cycle
+            h0 = members[0]["hash"] if members else ""
+            sz = members[0]["size"] if members else 0
+            names = {Path(p["path"]).name for p in actives}
+            note = ("filenames differ — matched by content"
+                    if len(names) > 1 else "same filename in multiple locations")
+            return (f"identical content — {HASH_NAME} {h0[:12]}…, "
+                    f"{sz:,} bytes, {len(actives)} copies; {note}")
+        if kind == "near_image":
+            from . import phash
+            from .near import NEAR_IMAGE_THRESHOLD
+            hs = [m["hash"] for m in members]
+            if not hs:
+                return "perceptual near-match"
+            ph = ",".join("?" * len(hs))
+            sigs = {r["hash"]: r["value"] for r in self.conn.execute(
+                f"SELECT hash, value FROM signatures WHERE algo='phash_image' "
+                f"AND hash IN ({ph})", hs)}
+            dims = {r["hash"]: (r["w"], r["h"]) for r in self.conn.execute(
+                f"SELECT hash, w, h FROM signatures WHERE algo='phash_image' "
+                f"AND hash IN ({ph})", hs)}
+            ref = phash.from_hex(sigs[hs[0]]) if hs[0] in sigs else None
+            for m in members:
+                w, h = dims.get(m["hash"], (None, None))
+                m["w"], m["h"] = w, h
+                sv = sigs.get(m["hash"])
+                m["distance"] = (phash.hamming(ref, phash.from_hex(sv))
+                                 if (ref is not None and sv) else None)
+            return (f"perceptual near-match — dHash Hamming ≤ {NEAR_IMAGE_THRESHOLD}, "
+                    f"same aspect ratio (not byte-identical; sizes/format may differ)")
+        if kind == "doc_version":
+            return "text near-duplicate — similar SimHash + shared folder/filename stem"
+        if kind == "topic":
+            return "grouped by inferred topic — not duplicates"
+        return ""
 
     # ---------- review actions (all reversible via decisions) ----------
     def _record_decision(self, action: str, payload: dict) -> int:

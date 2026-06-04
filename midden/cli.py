@@ -25,7 +25,7 @@ DEFAULT_DB = Path.home() / ".midden" / "index.sqlite"
 
 def cmd_ingest(args) -> int:
     store = Store(args.db)
-    n_hashed = n_skipped = n_err = n_symlink = n_pruned = 0
+    n_hashed = n_skipped = n_err = n_symlink = n_pruned = n_short = 0
     bytes_hashed = 0
     last_print = 0.0
     for ev in ingest(Path(args.root), store, label=args.label, prune=args.prune):
@@ -43,6 +43,9 @@ def cmd_ingest(args) -> int:
             n_skipped += 1
         elif ev.kind == "skipped_symlink":
             n_symlink += 1
+        elif ev.kind == "short_read":
+            n_short += 1
+            print(f"  SHORT READ (skipped) {ev.path}: {ev.error}", file=sys.stderr)
         elif ev.kind == "pruned":
             n_pruned = ev.count
             print(f"  pruned {n_pruned} vanished path(s) (snapshot in decisions log)")
@@ -52,8 +55,8 @@ def cmd_ingest(args) -> int:
         elif ev.kind == "done":
             print(
                 f"[done] hashed={n_hashed} skipped={n_skipped} "
-                f"symlinks={n_symlink} pruned={n_pruned} errors={n_err} "
-                f"bytes_hashed={bytes_hashed/1e6:.1f}MB "
+                f"symlinks={n_symlink} short_read={n_short} pruned={n_pruned} "
+                f"errors={n_err} bytes_hashed={bytes_hashed/1e6:.1f}MB "
                 f"in {ev.elapsed:.1f}s"
             )
     store.close()
@@ -132,12 +135,20 @@ def cmd_cluster(args) -> int:
     store = Store(args.db)
     n_exact = store.materialize_exact_clusters()
     print(f"[cluster] exact-dup clusters: +{n_exact} new")
-    r = near.recluster(store)
+    if args.reset_near:
+        print("[cluster] resetting near_image clusters before rebuild…")
+    if args.recompute_images:
+        print("[cluster] recomputing image signatures (re-reading images for dimensions)…")
+    r = near.recluster(store, reset_near=args.reset_near,
+                       recompute_images=args.recompute_images)
+    if r.get("near_image_removed"):
+        print(f"[cluster] near_image removed: -{r['near_image_removed']} old clusters")
     print(f"[cluster] text signatures:    +{r['text_signatures']} computed")
     print(f"[cluster] image signatures:   +{r['image_signatures']} computed"
           f"{'  (Pillow not installed)' if not near.phash.PIL_AVAILABLE else ''}")
     print(f"[cluster] doc_version:        +{r['doc_version_clusters']} new")
-    print(f"[cluster] near_image:         +{r['near_image_clusters']} new")
+    print(f"[cluster] near_image:         +{r['near_image_clusters']} new  "
+          f"(dropped {r['dropped_degenerate']} blank, {r['dropped_oversize']} oversize)")
     ov = store.overview()
     print(f"[cluster] open queue: {ov['clusters_unresolved']} clusters {dict(ov['open_by_kind'])}")
     store.close()
@@ -226,6 +237,12 @@ def main(argv=None) -> int:
     p_dup.set_defaults(func=cmd_dups)
 
     p_cl = sub.add_parser("cluster", help="detect exact + near duplicates")
+    p_cl.add_argument("--reset-near", action="store_true",
+                      help="delete existing near_image clusters before rebuilding "
+                           "(repair; snapshotted to the decisions log)")
+    p_cl.add_argument("--recompute-images", action="store_true",
+                      help="re-read images to backfill dimensions on signatures "
+                           "computed before dimensions were tracked")
     p_cl.set_defaults(func=cmd_cluster)
 
     p_tp = sub.add_parser("topics", help="infer document topics + cluster by project")

@@ -47,7 +47,16 @@
   .cluster { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:16px; }
   .cluster.resolved { opacity:.6; }
   .cluster h2 { margin:0 0 4px; font-size:15px; }
-  .cluster .sub { color:var(--dim); font-size:12px; margin-bottom:14px; }
+  .cluster .sub { color:var(--dim); font-size:12px; margin-bottom:6px; }
+  .cluster .why {
+    font-size:12px; color:var(--ink); background:var(--panel2);
+    border:1px solid var(--line); border-left:3px solid var(--accent);
+    border-radius:6px; padding:7px 10px; margin-bottom:14px;
+  }
+  .thumb {
+    width:48px; height:48px; object-fit:cover; border-radius:4px;
+    border:1px solid var(--line); flex:none; background:#0d0f15;
+  }
   .paths { display:flex; flex-direction:column; gap:8px; }
   .p {
     display:flex; align-items:center; gap:12px; padding:10px 12px;
@@ -292,7 +301,8 @@ async function loadOverview(){
   $("#ovGrid").innerHTML = cards.map(([k,l,c,fn])=>`
     <div class="card"><div class="n ${c}">${fn?fn(o[k]):o[k].toLocaleString()}</div>
     <div class="l">${l}</div></div>`).join("");
-  $("#globalHint").textContent = `${o.clusters_dedup_open} in queue`;
+  $("#globalHint").textContent = `${o.clusters_dedup_open} in queue`
+    + (o.exact_hidden ? ` · ${o.exact_hidden.toLocaleString()} sub-${fmtBytes(o.exact_review_floor)} dup groups hidden` : "");
 }
 
 // ---- ingest ----
@@ -384,7 +394,9 @@ $("#ingestAnother").onclick=()=>{
 let queue = [], qi = 0, currentCluster = null;
 async function loadQueue(){
   // dedup kinds only — topic clusters are non-destructive groupings (Projects tab)
-  const r = await api("/api/clusters?include_resolved=false&kinds=exact,doc_version,near_image");
+  // min_reclaimable hides trivially-tiny exact-dup groups (sub-1MiB) that would
+  // otherwise bury the high-value duplicates; near_image/doc_version unaffected.
+  const r = await api("/api/clusters?include_resolved=false&kinds=exact,doc_version,near_image&min_reclaimable=1048576");
   queue = r.clusters; qi = 0;
   if (!queue.length){ renderEmpty(); return; }
   await renderCluster();
@@ -413,26 +425,38 @@ async function renderCluster(){
     near_image:  {title:"Similar images",    noun:"image",   nouns:"images",
                   hint:"visually similar — keep one"},
   }[c.kind] || {title:c.kind, noun:"item", nouns:"items", hint:""};
+  const isImg = c.kind === "near_image";
+  // per-hash perceptual metadata (distance from reference, dimensions)
+  const mdata = {};
+  (c.members||[]).forEach(m=>{ mdata[m.hash] = {distance:m.distance, w:m.w, h:m.h}; });
   const rows = c.paths.map((p)=>{
     const activeIdx = p.status==="active" ? actives.indexOf(p)+1 : null;
     const badge = p.status==="purgatory"
       ? `<span class="badge purg">purgatory</span>` : "";
+    const md = mdata[p.hash] || {};
+    const dims = (isImg && md.w) ? ` · ${md.w}×${md.h}` : "";
+    const dist = (isImg && md.distance!=null)
+      ? ` · <span class="badge" title="perceptual distance from the first image (0 = visually identical)">Δ${md.distance}</span>` : "";
     // for multi-hash clusters each path is a distinct file — show its own size + hash
     const meta = multi
-      ? `<div class="drive">drive ${p.drive_id.slice(0,8)} · ${fmtBytes(p.size)} · ${p.hash.slice(0,8)}</div>`
+      ? `<div class="drive">drive ${p.drive_id.slice(0,8)} · ${fmtBytes(p.size)} · ${p.hash.slice(0,8)}${dims}${dist}</div>`
       : `<div class="drive">drive ${p.drive_id.slice(0,8)}</div>`;
+    const thumb = isImg
+      ? `<img class="thumb" src="/api/thumb/${p.hash}" loading="lazy" alt="" onerror="this.style.visibility='hidden'">` : "";
     return `<div class="p ${p.status==='purgatory'?'purged':''}" data-pid="${p.id}" data-keep="${p.status==='active'}">
-      <div class="idx">${activeIdx??"·"}</div>
-      <div><div class="path">${esc(p.path)}</div>${meta}</div>
-      <div class="spacer" style="flex:1"></div>${badge}</div>`;
+      <div class="idx">${activeIdx??"·"}</div>${thumb}
+      <div style="flex:1"><div class="path">${esc(p.path)}</div>${meta}</div>
+      ${badge}</div>`;
   }).join("");
   const sub = multi
     ? `${c.n_active} ${c.n_active===1?KIND.noun:KIND.nouns} · ${fmtBytes(c.reclaimable)} reclaimable`
     : `${fmtBytes(actives[0]?.size||0)} each · ${fmtBytes(c.reclaimable)} reclaimable · ${actives[0]?.hash.slice(0,16)||""}…`;
+  const why = c.rationale ? `<div class="why">${esc(c.rationale)}</div>` : "";
   $("#reviewBody").innerHTML = `
     <div class="cluster ${c.resolved?'resolved':''}">
       <h2>${KIND.title} · ${actives.length} active ${actives.length===1?KIND.noun:KIND.nouns}</h2>
       <div class="sub">${sub}</div>
+      ${why}
       <div class="paths">${rows}</div>
       <div class="actions">
         <span class="hint">${KIND.hint} — click one or press its number; <kbd>P</kbd> purges all</span>

@@ -18,7 +18,7 @@ import time
 from pathlib import Path
 from urllib.parse import urlparse
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -44,7 +44,7 @@ def create_app(db_path: Path) -> FastAPI:
     # Materialize clusters on boot from whatever is already indexed/signed.
     n_exact = store.materialize_exact_clusters()
     n_doc = near.materialize_doc_versions(store)
-    n_img = near.materialize_near_images(store)
+    n_img = near.materialize_near_images(store)["created"]
     n_topic = topics.materialize_topics(store)  # from persisted topic tags, if any
     app.state.store = store
     app.state.bootstrap = {"exact": n_exact, "doc_version": n_doc,
@@ -74,19 +74,28 @@ def create_app(db_path: Path) -> FastAPI:
         return store.overview()
 
     @app.post("/api/recluster")
-    def recluster() -> dict:
-        """Recompute signatures (reads files) and materialize near clusters."""
-        result = near.recluster(store)
+    def recluster(reset_near: bool = False, recompute_images: bool = False) -> dict:
+        """Recompute signatures (reads files) and materialize near clusters.
+
+        reset_near rebuilds near_image clusters from scratch (repair after the
+        clustering fix); recompute_images re-reads images to backfill dimensions.
+        """
+        result = near.recluster(store, reset_near=reset_near,
+                                recompute_images=recompute_images)
         result["exact"] = store.materialize_exact_clusters()
         return {**result, **store.overview()}
 
     @app.get("/api/clusters")
-    def clusters(include_resolved: bool = False, kinds: str = "") -> dict:
+    def clusters(include_resolved: bool = False, kinds: str = "",
+                 min_reclaimable: int = 0) -> dict:
         # `kinds`: optional comma-separated filter. The review queue passes the
         # dedup kinds; the Projects view passes "topic". Empty = all kinds.
+        # `min_reclaimable`: hide low-value exact groups (the review queue passes
+        # the floor; 0 shows everything).
         kind_tuple = tuple(k for k in kinds.split(",") if k) or None
         return {"clusters": store.list_clusters(
-            include_resolved=include_resolved, kinds=kind_tuple)}
+            include_resolved=include_resolved, kinds=kind_tuple,
+            min_reclaimable=min_reclaimable)}
 
     @app.get("/api/clusters/{cluster_id}")
     def cluster(cluster_id: int) -> dict:
@@ -119,6 +128,31 @@ def create_app(db_path: Path) -> FastAPI:
     @app.get("/api/search")
     def search(q: str, include_purgatory: bool = False) -> dict:
         return {"results": store.search(q, include_purgatory=include_purgatory)}
+
+    @app.get("/api/thumb/{hash}")
+    def thumb(hash: str):
+        """Downscaled JPEG of one active copy of `hash`, for the image review.
+        Path is resolved strictly from the DB (never client-supplied); any
+        non-image / unreadable source returns 404 so the UI falls back to text."""
+        import io
+
+        from . import phash
+        if not phash.PIL_AVAILABLE:
+            raise HTTPException(404, "thumbnails unavailable (Pillow not installed)")
+        src = store.thumb_source(hash)
+        if not src:
+            raise HTTPException(404, "no active source for this hash")
+        from PIL import Image
+        try:
+            with Image.open(src) as im:
+                im = im.convert("RGB")
+                im.thumbnail((160, 160))
+                buf = io.BytesIO()
+                im.save(buf, format="JPEG", quality=80)
+        except Exception:
+            raise HTTPException(404, "not a renderable image")
+        return Response(content=buf.getvalue(), media_type="image/jpeg",
+                        headers={"Cache-Control": "max-age=3600"})
 
     @app.get("/api/purgatory")
     def purgatory() -> dict:
@@ -183,7 +217,7 @@ def create_app(db_path: Path) -> FastAPI:
 
         def gen():
             job = Store(db_path, same_thread=False)
-            n_hashed = n_skipped = n_err = n_symlink = 0
+            n_hashed = n_skipped = n_err = n_symlink = n_short = 0
             bytes_hashed = 0
             last = 0.0
             try:
@@ -203,6 +237,10 @@ def create_app(db_path: Path) -> FastAPI:
                         n_skipped += 1
                     elif ev.kind == "skipped_symlink":
                         n_symlink += 1
+                    elif ev.kind == "short_read":
+                        n_short += 1
+                        yield sse({"kind": "short_read", "path": ev.path,
+                                   "error": ev.error})
                     elif ev.kind == "error":
                         n_err += 1
                         yield sse({"kind": "file_error", "path": ev.path,
@@ -211,6 +249,7 @@ def create_app(db_path: Path) -> FastAPI:
                         n_clusters = job.materialize_exact_clusters()
                         yield sse({"kind": "done", "hashed": n_hashed,
                                    "skipped": n_skipped, "symlinks": n_symlink,
+                                   "short_read": n_short,
                                    "errors": n_err, "bytes": bytes_hashed,
                                    "elapsed": ev.elapsed,
                                    "exact_clusters": n_clusters,
