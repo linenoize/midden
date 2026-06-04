@@ -9,6 +9,9 @@ venv/
 build/
 dist/
 
+# Local secrets / config — the key lives here, never in git (.env.example is tracked)
+.env
+
 # Midden runtime data
 *.sqlite
 *.sqlite-wal

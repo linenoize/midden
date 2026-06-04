@@ -13,8 +13,11 @@ Inference backend is pluggable:
 - "stub"      deterministic, offline. Uses a document's markdown H1 title as its
               topic (falls back to no-tag). For tests and as a no-model fallback.
               Tags are stored with source='rule'.
-- "ollama"    local model at http://localhost:11434, schema-constrained JSON. The
-              privacy-preserving default — file contents never leave the machine.
+- "local"     the LAN LLM server (llama.cpp + llama-swap on FIEF), reached over
+              the OpenAI-compatible API at $MIDDEN_LLM_BASE (default
+              http://192.168.1.208:8080/v1). The privacy-preserving default —
+              file contents stay on the local subnet, never the cloud. Replaces
+              the former Ollama backend; see windows-sysadmin/CONNECT.md.
 - "anthropic" Claude via the API (opt-in). Sends first-chunk text to the cloud;
               requires ANTHROPIC_API_KEY and the `anthropic` package.
 
@@ -35,39 +38,60 @@ from . import near
 from .store import Store
 
 TOPIC_READ_BYTES = 8 * 1024            # first chunk is plenty for a subject guess
-DEFAULT_OLLAMA_BASE = "http://localhost:11434"
-DEFAULT_OLLAMA_MODEL = "llama3.2:latest"
+# OpenAI-compatible LLM server (llama.cpp + llama-swap on FIEF). One endpoint
+# serves every model; the model is chosen per request. See CONNECT.md.
+DEFAULT_LLM_BASE = "http://192.168.1.208:8080/v1"
+DEFAULT_LLM_MODEL = "llama3.1-8b"      # fast, solid instruction-following for JSON
+DEFAULT_LLM_PORT = "8080"
 DEFAULT_ANTHROPIC_MODEL = "claude-haiku-4-5-20251001"
 
 
-def ollama_base(base_url: Optional[str] = None) -> str:
-    """Resolve the Ollama base URL: explicit arg > $OLLAMA_HOST > localhost.
+def llm_base(base_url: Optional[str] = None) -> str:
+    """Resolve the LLM base URL: explicit arg > $MIDDEN_LLM_BASE > FIEF default.
 
-    Lets Midden run on one host and reach Ollama on another (the user's
-    separate-server setup). $OLLAMA_HOST is Ollama's own convention; we accept a
-    bare host[:port] and add the scheme/default port so `export OLLAMA_HOST=
-    192.168.1.5` works as well as a full URL.
+    Lets Midden run on one host and reach the model server on another. Accepts a
+    full URL or a bare host[:port]; supplies the scheme, the server's default
+    port, and the `/v1` suffix the OpenAI-compatible API expects, so
+    `MIDDEN_LLM_BASE=192.168.1.208` works as well as the full URL.
     """
-    raw = (base_url or os.environ.get("OLLAMA_HOST") or DEFAULT_OLLAMA_BASE).strip()
+    raw = (base_url or os.environ.get("MIDDEN_LLM_BASE") or DEFAULT_LLM_BASE).strip()
     if "://" not in raw:
         raw = "http://" + raw
     raw = raw.rstrip("/")
-    # bare host with no port -> Ollama's default 11434
-    tail = raw.split("://", 1)[1]
-    if ":" not in tail:
-        raw = raw + ":11434"
+    scheme, _, rest = raw.partition("://")
+    host = rest.split("/", 1)[0]
+    if ":" not in host.strip("[]"):  # bare host, no port -> server's default
+        raw = raw.replace(rest, f"{host}:{DEFAULT_LLM_PORT}" + rest[len(host):], 1)
+    if not raw.endswith("/v1"):
+        raw = raw + "/v1"
     return raw
 
 
-def _ollama_chat(base_url: Optional[str] = None) -> str:
-    return ollama_base(base_url) + "/api/chat"
+def llm_api_key(api_key: Optional[str] = None) -> str:
+    """Resolve the API key: explicit arg > $MIDDEN_LLM_API_KEY > $OPENAI_API_KEY.
+
+    The env vars are populated from the repo-root `.env` on `import midden` (see
+    midden/env.py). Returns "" if none found (the request then goes out
+    unauthenticated and the server decides).
+    """
+    if api_key:
+        return api_key
+    for var in ("MIDDEN_LLM_API_KEY", "OPENAI_API_KEY"):
+        v = os.environ.get(var)
+        if v:
+            return v.strip()
+    return ""
 
 
-def _ollama_tags(base_url: Optional[str] = None) -> str:
-    return ollama_base(base_url) + "/api/tags"
+def _llm_chat(base_url: Optional[str] = None) -> str:
+    return llm_base(base_url) + "/chat/completions"
 
-# Schema the local/cloud models are constrained to (Ollama `format`, Anthropic
-# tool input). Matches tools/bench_ollama.py so the bench stays representative.
+
+def _llm_models(base_url: Optional[str] = None) -> str:
+    return llm_base(base_url) + "/models"
+
+# Schema the local/cloud models are constrained to (prompt + JSON mode locally,
+# Anthropic tool input). Kept literal here so the contract is in one place.
 TOPIC_SCHEMA = {
     "type": "object",
     "properties": {
@@ -108,7 +132,8 @@ def _infer_stub(text: str, rel: str) -> Optional[dict]:
     return {"topic": title, "slug": _slugify(title), "kind": "document", "confidence": 0.9}
 
 
-def _infer_ollama(text: str, model: str, base_url: Optional[str] = None) -> Optional[dict]:
+def _infer_local(text: str, model: str, base_url: Optional[str] = None,
+                 api_key: Optional[str] = None) -> Optional[dict]:
     body = {
         "model": model,
         "messages": [
@@ -116,20 +141,38 @@ def _infer_ollama(text: str, model: str, base_url: Optional[str] = None) -> Opti
             {"role": "user", "content": f"Categorize this file:\n\n{text}"},
         ],
         "stream": False,
-        "format": TOPIC_SCHEMA,
-        "options": {"temperature": 0},
+        "temperature": 0,
+        "max_tokens": 512,
+        # OpenAI-style JSON mode — broadly supported across the llama.cpp models
+        # behind llama-swap (json_schema support varies by model, JSON mode doesn't).
+        "response_format": {"type": "json_object"},
+        # Reasoning models (e.g. qwen3.5) "think" first and can return empty
+        # content under a small budget; disable thinking for this terse task.
+        "chat_template_kwargs": {"enable_thinking": False},
     }
+    headers = {"Content-Type": "application/json"}
+    key = llm_api_key(api_key)
+    if key:
+        headers["Authorization"] = f"Bearer {key}"
     req = urllib.request.Request(
-        _ollama_chat(base_url), data=json.dumps(body).encode(),
-        headers={"Content-Type": "application/json"},
-    )
+        _llm_chat(base_url), data=json.dumps(body).encode(), headers=headers)
     with urllib.request.urlopen(req, timeout=120) as resp:
         out = json.loads(resp.read())
-    content = out.get("message", {}).get("content", "")
+    choices = out.get("choices") or []
+    if not choices:
+        return None
+    content = (choices[0].get("message") or {}).get("content", "") or ""
     try:
         obj = json.loads(content)
     except json.JSONDecodeError:
-        return None
+        # Some models wrap the JSON in prose or code fences — grab the first {...}.
+        m = re.search(r"\{.*\}", content, re.DOTALL)
+        if not m:
+            return None
+        try:
+            obj = json.loads(m.group(0))
+        except json.JSONDecodeError:
+            return None
     return _coerce(obj)
 
 
@@ -139,7 +182,7 @@ def _infer_anthropic(text: str, model: str) -> Optional[dict]:
     except ImportError as e:
         raise RuntimeError(
             "anthropic package not installed — `pip install anthropic` or use "
-            "--backend ollama/stub"
+            "--backend local/stub"
         ) from e
     if not os.environ.get("ANTHROPIC_API_KEY"):
         raise RuntimeError("ANTHROPIC_API_KEY not set")
@@ -179,23 +222,29 @@ def _coerce(obj: dict) -> Optional[dict]:
 
 
 def infer(text: str, rel: str, *, backend: str, model: Optional[str] = None,
-          ollama_url: Optional[str] = None) -> Optional[dict]:
+          llm_url: Optional[str] = None, api_key: Optional[str] = None) -> Optional[dict]:
     if backend == "stub":
         return _infer_stub(text, rel)
-    if backend == "ollama":
-        return _infer_ollama(text, model or DEFAULT_OLLAMA_MODEL, ollama_url)
+    if backend == "local":
+        return _infer_local(text, model or DEFAULT_LLM_MODEL, llm_url, api_key)
     if backend == "anthropic":
         return _infer_anthropic(text, model or DEFAULT_ANTHROPIC_MODEL)
     raise ValueError(f"unknown backend: {backend}")
 
 
 # ---------- availability (for backend auto-select + UI hints) ----------
-def ollama_available(timeout: float = 2.0,
-                     base_url: Optional[str] = None) -> tuple[bool, list[str]]:
+def llm_available(timeout: float = 2.0, base_url: Optional[str] = None,
+                  api_key: Optional[str] = None) -> tuple[bool, list[str]]:
+    """Probe the LLM server's /v1/models. Returns (reachable, [model ids])."""
+    headers = {}
+    key = llm_api_key(api_key)
+    if key:
+        headers["Authorization"] = f"Bearer {key}"
     try:
-        with urllib.request.urlopen(_ollama_tags(base_url), timeout=timeout) as r:
+        req = urllib.request.Request(_llm_models(base_url), headers=headers)
+        with urllib.request.urlopen(req, timeout=timeout) as r:
             data = json.loads(r.read())
-        return True, [m.get("name", "") for m in data.get("models", [])]
+        return True, [m.get("id", "") for m in data.get("data", [])]
     except (urllib.error.URLError, OSError, json.JSONDecodeError):
         return False, []
 
@@ -209,19 +258,19 @@ def anthropic_available() -> bool:
 
 
 def resolve_backend(requested: str = "auto",
-                    ollama_url: Optional[str] = None) -> str:
-    """Map 'auto' to the best available backend (ollama > stub). Explicit wins."""
+                    llm_url: Optional[str] = None) -> str:
+    """Map 'auto' to the best available backend (local > stub). Explicit wins."""
     if requested != "auto":
         return requested
-    if ollama_available(base_url=ollama_url)[0]:
-        return "ollama"
+    if llm_available(base_url=llm_url)[0]:
+        return "local"
     return "stub"
 
 
 # ---------- inference pass (reads files) ----------
 def compute_topics(store: Store, *, backend: str, model: Optional[str] = None,
-                   limit: Optional[int] = None,
-                   ollama_url: Optional[str] = None) -> Iterator[dict]:
+                   limit: Optional[int] = None, llm_url: Optional[str] = None,
+                   api_key: Optional[str] = None) -> Iterator[dict]:
     """Tag active, untagged text files with an inferred topic. Yields events.
 
     Idempotent: files that already carry a `topic_slug` tag are skipped, so a
@@ -247,7 +296,7 @@ def compute_topics(store: Store, *, backend: str, model: Optional[str] = None,
             continue
         try:
             result = infer(text, f["rel"], backend=backend, model=model,
-                           ollama_url=ollama_url)
+                           llm_url=llm_url, api_key=api_key)
         except Exception as e:  # noqa: BLE001 — model/transport failure, surface it
             errors += 1
             yield {"kind": "error", "path": f["rel"], "error": str(e)}
@@ -285,11 +334,12 @@ def materialize_topics(store: Store, min_size: int = 2) -> int:
 
 
 def run_topics(store: Store, *, backend: str = "stub", model: Optional[str] = None,
-               limit: Optional[int] = None, ollama_url: Optional[str] = None) -> dict:
+               limit: Optional[int] = None, llm_url: Optional[str] = None,
+               api_key: Optional[str] = None) -> dict:
     """Drain compute_topics + materialize. Convenience for the CLI/tests."""
     tagged = skipped = errors = 0
     for ev in compute_topics(store, backend=backend, model=model, limit=limit,
-                             ollama_url=ollama_url):
+                             llm_url=llm_url, api_key=api_key):
         if ev["kind"] == "tagged_done":
             tagged, skipped, errors = ev["tagged"], ev["skipped"], ev["errors"]
     n_clusters = materialize_topics(store)

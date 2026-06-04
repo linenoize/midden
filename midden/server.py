@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 import string
 import time
+from contextlib import asynccontextmanager
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -38,33 +39,67 @@ class KeepBody(BaseModel):
     path_id: int
 
 
-def create_app(db_path: Path) -> FastAPI:
-    app = FastAPI(title="Midden", version="0.1.0")
+def create_app(db_path: Path, materialize: bool = True) -> FastAPI:
     store = Store(db_path, same_thread=False)
-    # Materialize clusters on boot from whatever is already indexed/signed.
-    n_exact = store.materialize_exact_clusters()
-    n_doc = near.materialize_doc_versions(store)
-    n_img = near.materialize_near_images(store)["created"]
-    n_topic = topics.materialize_topics(store)  # from persisted topic tags, if any
+
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        """Materialize clusters from already-stored signatures, on startup.
+
+        Runs inside the lifespan (not at create_app time) so uvicorn binds the
+        port *first* — the server is reachable immediately and a quick restart
+        doesn't race the previous instance's socket. Materialized clusters are
+        persisted in the DB, so `--skip-materialize` safely reuses the last run's
+        results when the index hasn't changed since.
+        """
+        if not materialize:
+            app.state.bootstrap = {"exact": 0, "doc_version": 0, "near_image": 0,
+                                   "topic": 0, "skipped": True}
+            print("[midden] skipped boot materialization (--skip-materialize); "
+                  "reusing clusters already in the DB")
+        else:
+            n_exact = store.materialize_exact_clusters()
+            n_doc = near.materialize_doc_versions(store)
+            n_img = near.materialize_near_images(store)["created"]
+            n_topic = topics.materialize_topics(store)  # from persisted tags, if any
+            app.state.bootstrap = {"exact": n_exact, "doc_version": n_doc,
+                                   "near_image": n_img, "topic": n_topic}
+            print(f"[midden] materialized on boot: exact +{n_exact}, "
+                  f"doc_version +{n_doc}, near_image +{n_img}, topic +{n_topic}")
+        yield
+        store.close()
+
+    app = FastAPI(title="Midden", version="0.1.0", lifespan=lifespan)
     app.state.store = store
-    app.state.bootstrap = {"exact": n_exact, "doc_version": n_doc,
-                           "near_image": n_img, "topic": n_topic}
+    app.state.bootstrap = None
 
     @app.middleware("http")
     async def csrf_guard(request: Request, call_next):
-        """Reject cross-origin state-changing requests.
+        """Reject *genuinely* cross-origin state-changing requests.
 
         Several mutation endpoints are bodyless POSTs (purge_all, undo, restore,
         recluster), which browsers treat as "simple" requests — no CORS preflight
-        — so any web page the user has open could fire them at the loopback
-        server. We block any mutating request whose Origin is not a loopback host.
-        Requests with no Origin (CLI/tests/curl) are allowed.
+        — so any web page the user has open could fire them at the server. We
+        block a mutating request only when its Origin host differs from the host
+        the page was actually served from (the request's own Host header).
+
+        Comparing against Host (not a fixed loopback allowlist) is what makes
+        same-origin work under `serve --allow-remote`: a UI loaded from
+        http://192.168.1.214:8765 sends `Origin: http://192.168.1.214:8765`, whose
+        host matches `Host: 192.168.1.214:8765` — same origin, allowed. Loopback
+        is always treated as same-origin; requests with no Origin
+        (CLI/tests/curl) are allowed.
         """
         if request.method in _MUTATING_METHODS:
             origin = request.headers.get("origin")
             if origin:
-                host = (urlparse(origin).hostname or "").strip("[]")
-                if host not in LOOPBACK_HOSTS:
+                origin_host = (urlparse(origin).hostname or "").strip("[]")
+                # Hostname the page was served from (Host header, port stripped).
+                served_host = (urlparse(
+                    f"//{request.headers.get('host', '')}").hostname or "").strip("[]")
+                same_origin = (
+                    origin_host == served_host or origin_host in LOOPBACK_HOSTS)
+                if not same_origin:
                     return JSONResponse(
                         {"detail": "cross-origin request refused"}, status_code=403)
         return await call_next(request)
@@ -278,9 +313,10 @@ def create_app(db_path: Path) -> FastAPI:
     @app.get("/api/topics/health")
     def topics_health() -> dict:
         """Which inference backends are usable right now (drives the UI picker)."""
-        ok, models = topics.ollama_available()
+        ok, models = topics.llm_available()
         return {
-            "ollama": {"available": ok, "models": models},
+            "local": {"available": ok, "models": models,
+                      "base": topics.llm_base()},
             "anthropic": {"available": topics.anthropic_available()},
             "stub": {"available": True},
             "default": topics.resolve_backend("auto"),
@@ -333,8 +369,25 @@ def create_app(db_path: Path) -> FastAPI:
 
 
 def serve(db_path: Path, host: str = "127.0.0.1", port: int = 8000,
-          allow_remote: bool = False) -> None:
+          allow_remote: bool = False, materialize: bool = True) -> None:
+    import os
     import uvicorn
+
+    from . import env
+
+    # Require the LLM API key before launching. It lives in the gitignored .env at
+    # the repo root (populated into the environment on `import midden`); we reload
+    # here so a freshly-edited .env is picked up without re-importing. Refusing to
+    # start without it is a deliberate product decision — topic inference is a core
+    # feature and a silently keyless server is a confusing half-broken state.
+    env.load_dotenv()
+    if not os.environ.get("MIDDEN_LLM_API_KEY"):
+        raise SystemExit(
+            f"[midden] MIDDEN_LLM_API_KEY is not set. Copy {env.REPO_ROOT / '.env.example'} "
+            f"to {env.REPO_ROOT / '.env'} and fill in the key (see "
+            f"windows-sysadmin/CONNECT.md), or export MIDDEN_LLM_API_KEY in your "
+            f"environment, then start `midden serve` again."
+        )
 
     # The folder picker (/api/dirs) lists the server's filesystem and the ingest
     # stream (/api/ingest/stream?path=) walks/hashes any server path — both
@@ -347,12 +400,10 @@ def serve(db_path: Path, host: str = "127.0.0.1", port: int = 8000,
             f"--allow-remote if you really intend to serve a non-loopback interface."
         )
 
-    app = create_app(db_path)
-    b = app.state.bootstrap
+    app = create_app(db_path, materialize=materialize)
     print(f"[midden] serving {db_path}")
-    print(f"[midden] materialized on boot: exact +{b['exact']}, "
-          f"doc_version +{b['doc_version']}, near_image +{b['near_image']}, "
-          f"topic +{b['topic']}")
+    # Cluster materialization runs in the startup handler (after the port binds)
+    # and prints its own summary there.
     print(f"[midden] ingest a folder from the UI (Ingest tab) or `python -m midden.cli ingest <dir>`")
     print(f"[midden] open http://{host}:{port}/")
     uvicorn.run(app, host=host, port=port, log_level="warning")

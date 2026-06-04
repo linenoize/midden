@@ -6,8 +6,8 @@ Usage:
     python -m midden.cli stats     [--db PATH]
     python -m midden.cli dups      [--db PATH] [--min-size N] [--json]
     python -m midden.cli cluster   [--db PATH]             # exact + near-dup detection
-    python -m midden.cli topics    [--db PATH] [--backend auto|stub|ollama|anthropic] [--ollama-url URL]
-    python -m midden.cli serve     [--db PATH] [--host H] [--port N]
+    python -m midden.cli topics    [--db PATH] [--backend auto|stub|local|anthropic] [--llm-url URL]
+    python -m midden.cli serve     [--db PATH] [--host H] [--port N] [--allow-remote] [--skip-materialize]
 """
 from __future__ import annotations
 
@@ -158,18 +158,19 @@ def cmd_cluster(args) -> int:
 def cmd_topics(args) -> int:
     from . import topics
     store = Store(args.db)
-    ollama_url = args.ollama_url or None
-    backend = topics.resolve_backend(args.backend, ollama_url=ollama_url)
-    if backend == "ollama":
-        base = topics.ollama_base(ollama_url)
-        ok, models = topics.ollama_available(base_url=ollama_url)
+    llm_url = args.llm_url or None
+    backend = topics.resolve_backend(args.backend, llm_url=llm_url)
+    if backend == "local":
+        base = topics.llm_base(llm_url)
+        ok, models = topics.llm_available(base_url=llm_url)
         if not ok:
-            print(f"[topics] ollama not reachable at {base} — start it, set "
-                  "OLLAMA_HOST / --ollama-url, or use --backend stub", file=sys.stderr)
+            print(f"[topics] LLM server not reachable at {base} — check it's up, "
+                  "set MIDDEN_LLM_BASE / --llm-url, or use --backend stub",
+                  file=sys.stderr)
             store.close()
             return 1
-        print(f"[topics] backend=ollama url={base} "
-              f"model={args.model or topics.DEFAULT_OLLAMA_MODEL} "
+        print(f"[topics] backend=local url={base} "
+              f"model={args.model or topics.DEFAULT_LLM_MODEL} "
               f"(available: {', '.join(models) or 'none'})")
     elif backend == "anthropic" and not topics.anthropic_available():
         print("[topics] anthropic unavailable — set ANTHROPIC_API_KEY and "
@@ -181,7 +182,7 @@ def cmd_topics(args) -> int:
 
     n = 0
     for ev in topics.compute_topics(store, backend=backend, model=args.model or None,
-                                    limit=args.limit or None, ollama_url=ollama_url):
+                                    limit=args.limit or None, llm_url=llm_url):
         if ev["kind"] == "started":
             print(f"[topics] tagging {ev['total']} untagged doc(s)…")
         elif ev["kind"] == "progress":
@@ -201,7 +202,8 @@ def cmd_topics(args) -> int:
 
 def cmd_serve(args) -> int:
     from .server import serve
-    serve(args.db, host=args.host, port=args.port, allow_remote=args.allow_remote)
+    serve(args.db, host=args.host, port=args.port, allow_remote=args.allow_remote,
+          materialize=not args.skip_materialize)
     return 0
 
 
@@ -246,12 +248,14 @@ def main(argv=None) -> int:
     p_cl.set_defaults(func=cmd_cluster)
 
     p_tp = sub.add_parser("topics", help="infer document topics + cluster by project")
-    p_tp.add_argument("--backend", choices=["auto", "stub", "ollama", "anthropic"],
-                      default="auto", help="inference backend (auto: ollama if up, else stub)")
-    p_tp.add_argument("--model", default="", help="model name (backend-specific)")
-    p_tp.add_argument("--ollama-url", default="",
-                      help="Ollama base URL for remote servers, e.g. "
-                           "http://192.168.1.5:11434 (default: $OLLAMA_HOST or localhost)")
+    p_tp.add_argument("--backend", choices=["auto", "stub", "local", "anthropic"],
+                      default="auto", help="inference backend (auto: local LLM if up, else stub)")
+    p_tp.add_argument("--model", default="", help="model name (backend-specific, "
+                      "e.g. llama3.1-8b, qwen3.5)")
+    p_tp.add_argument("--llm-url", default="",
+                      help="OpenAI-compatible LLM base URL, e.g. "
+                           "http://192.168.1.208:8080/v1 (default: $MIDDEN_LLM_BASE "
+                           "or the FIEF server)")
     p_tp.add_argument("--limit", type=int, default=0, help="cap docs processed (0 = all)")
     p_tp.add_argument("--quiet", action="store_true")
     p_tp.set_defaults(func=cmd_topics)
@@ -262,6 +266,10 @@ def main(argv=None) -> int:
     p_srv.add_argument("--allow-remote", action="store_true",
                        help="permit binding a non-loopback host (exposes the "
                             "filesystem picker + ingest with no auth — unsafe)")
+    p_srv.add_argument("--skip-materialize", action="store_true",
+                       help="don't rematerialize clusters on boot — reuse what's "
+                            "already in the DB (fast restart when the index is "
+                            "unchanged)")
     p_srv.set_defaults(func=cmd_serve)
 
     args = ap.parse_args(argv)

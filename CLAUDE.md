@@ -95,8 +95,10 @@ midden/
   docs/
     midden_design.md   # full design rationale — read this if context is missing
     ROADMAP.md         # where the project is headed
+  .env.example         # config template — copy to .env, set MIDDEN_LLM_API_KEY (gitignored)
   midden/
-    __init__.py
+    __init__.py        # loads .env from the repo root on import
+    env.py             # minimal stdlib .env loader (no python-dotenv dep)
     store.py           # SQLite schema + access (the ONLY thing that touches schema)
     drives.py          # stable drive IDs via .midden_drive.json marker
     ingest.py          # walk + hash + insert; read-only, idempotent; batched writes; yields events
@@ -104,7 +106,7 @@ midden/
     near.py            # near-duplicate clustering orchestration
     simhash.py         # text simhash fingerprints
     phash.py           # image perceptual (dHash) fingerprints
-    topics.py          # document topic inference (stub / ollama / anthropic)
+    topics.py          # document topic inference (stub / local LLM / anthropic)
     server.py          # FastAPI server for the review UI
     ui/index.html      # single-page cluster-review UI
     cli.py             # argparse-based CLI

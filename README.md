@@ -23,7 +23,7 @@ rationale and [`docs/ROADMAP.md`](docs/ROADMAP.md) for where it's going.
   (dHash) for visually similar images.
 - **Topic inference** — reads the first chunk of each document and assigns a topic tag,
   then clusters files into inferred "projects." Works offline with a deterministic stub,
-  or with a local Ollama model, or the Anthropic API.
+  or with a local LAN LLM server (OpenAI-compatible), or the Anthropic API.
 - **Cluster review UI** — a single web page for working through clusters one at a time:
   pick the canonical copy, send the rest to purgatory, skip, undo. Keyboard-driven.
 - **Purgatory, not deletion** — "delete" means hide from default views; every action is
@@ -59,8 +59,25 @@ Install only what you need; everything degrades gracefully if an extra is missin
 | `llm`      | topic inference via the Anthropic API   | `pip install -e ".[llm]"`    |
 | `all`      | everything above                        | `pip install -e ".[all]"`    |
 
-Topic inference also works against a local [Ollama](https://ollama.com) server with no
-extra install, or with a deterministic offline stub (`--backend stub`).
+Topic inference also works against a local LAN LLM server that speaks the OpenAI API
+(llama.cpp + llama-swap) with no extra install — point it with `--llm-url` or
+`$MIDDEN_LLM_BASE` (default `http://192.168.1.208:8080/v1`). Or use the deterministic
+offline stub (`--backend stub`). File contents stay on the local subnet with the
+`local` backend.
+
+### Configuration (`.env`)
+
+Midden reads a `.env` file from the repo root on startup. Copy the template and fill
+in the LLM API key:
+
+```bash
+cp .env.example .env            # PowerShell: Copy-Item .env.example .env
+# then edit .env and set MIDDEN_LLM_API_KEY=...
+```
+
+`.env` is gitignored — the key never lands in version control. **`midden serve` refuses
+to launch unless `MIDDEN_LLM_API_KEY` is set** (via `.env` or a real environment
+variable). The key for the LAN server is documented in `windows-sysadmin/CONNECT.md`.
 
 ## Try it on the synthetic corpus
 
@@ -81,7 +98,7 @@ python -m midden.cli --db ./midden.sqlite dups
 # 4. cluster exact + near duplicates
 python -m midden.cli --db ./midden.sqlite cluster
 
-# 5. infer topics (offline stub; swap for --backend ollama or anthropic)
+# 5. infer topics (offline stub; swap for --backend local or anthropic)
 python -m midden.cli --db ./midden.sqlite topics --backend stub
 
 # 6. review clusters in the browser (needs the `web` extra)
@@ -101,8 +118,8 @@ python -m midden.cli [--db PATH] <command>
   stats                                     print index stats
   dups    [--min-size N] [--limit N] [--json]   list exact-duplicate groups
   cluster [--reset-near] [--recompute-images]   detect exact + near duplicates
-  topics  [--backend auto|stub|ollama|anthropic] [--model M] [--limit N]
-  serve   [--host H] [--port N] [--allow-remote]   run the cluster-review web UI
+  topics  [--backend auto|stub|local|anthropic] [--model M] [--llm-url URL] [--limit N]
+  serve   [--host H] [--port N] [--allow-remote] [--skip-materialize]   cluster-review web UI
 ```
 
 The index defaults to `~/.midden/index.sqlite`; pass `--db` to use another location.
@@ -175,15 +192,17 @@ python tools/e2e_topics.py
 
 ```
 midden/
+  .env.example     # config template — copy to .env, set MIDDEN_LLM_API_KEY
   midden/
-    __init__.py
+    __init__.py    # loads .env from the repo root on import
+    env.py         # minimal stdlib .env loader (no python-dotenv dep)
     store.py       # SQLite schema + access layer (sole owner of the schema)
     drives.py      # stable drive IDs via the .midden_drive.json marker
     ingest.py      # read-only walk + hash + insert; idempotent; yields events
     near.py        # near-duplicate clustering orchestration
     simhash.py     # text simhash fingerprints
     phash.py       # image perceptual (dHash) fingerprints
-    topics.py      # document topic inference (stub / ollama / anthropic)
+    topics.py      # document topic inference (stub / local LLM / anthropic)
     server.py      # FastAPI server for the review UI
     ui/index.html  # the single-page cluster-review UI
     cli.py         # `python -m midden.cli ...`

@@ -50,67 +50,67 @@ def main() -> int:
     print(f"live detected groups:          {len(live_groups)}")
     check("live dup groups == ground truth", len(live_groups) == n_truth_groups)
 
-    # drive the API
+    # drive the API. The `with` runs the app lifespan, which materializes
+    # clusters on startup (bare TestClient(app) would skip it).
     app = create_app(db)
-    client = TestClient(app)
+    with TestClient(app) as client:
+        ov = client.get("/api/overview").json()
+        print(f"overview: {ov['clusters_unresolved']} unresolved clusters, "
+              f"{ov['paths_active']} active paths, saveable={ov['bytes_saveable']}")
+        check("materialized clusters == dup groups", ov["clusters_unresolved"] == n_truth_groups)
+        check("nothing in purgatory yet", ov["paths_purgatory"] == 0)
 
-    ov = client.get("/api/overview").json()
-    print(f"overview: {ov['clusters_unresolved']} unresolved clusters, "
-          f"{ov['paths_active']} active paths, saveable={ov['bytes_saveable']}")
-    check("materialized clusters == dup groups", ov["clusters_unresolved"] == n_truth_groups)
-    check("nothing in purgatory yet", ov["paths_purgatory"] == 0)
+        clusters = client.get("/api/clusters").json()["clusters"]
+        check("API lists all unresolved clusters", len(clusters) == n_truth_groups)
+        check("clusters sorted by reclaimable desc",
+              all(clusters[i]["reclaimable"] >= clusters[i+1]["reclaimable"]
+                  for i in range(len(clusters)-1)))
 
-    clusters = client.get("/api/clusters").json()["clusters"]
-    check("API lists all unresolved clusters", len(clusters) == n_truth_groups)
-    check("clusters sorted by reclaimable desc",
-          all(clusters[i]["reclaimable"] >= clusters[i+1]["reclaimable"]
-              for i in range(len(clusters)-1)))
+        # --- action 1: keep first copy of the biggest cluster ---
+        c0 = clusters[0]
+        detail = client.get(f"/api/clusters/{c0['id']}").json()
+        keep_pid = detail["paths"][0]["id"]
+        n_active_before = len([p for p in detail["paths"] if p["status"] == "active"])
+        r = client.post(f"/api/clusters/{c0['id']}/keep", json={"path_id": keep_pid}).json()
+        kept_active = [p for p in r["paths"] if p["status"] == "active"]
+        check("keep leaves exactly 1 active path", len(kept_active) == 1)
+        check("kept path is the one we chose", kept_active[0]["id"] == keep_pid)
+        check("keep marks cluster resolved", r["resolved"] is True)
 
-    # --- action 1: keep first copy of the biggest cluster ---
-    c0 = clusters[0]
-    detail = client.get(f"/api/clusters/{c0['id']}").json()
-    keep_pid = detail["paths"][0]["id"]
-    n_active_before = len([p for p in detail["paths"] if p["status"] == "active"])
-    r = client.post(f"/api/clusters/{c0['id']}/keep", json={"path_id": keep_pid}).json()
-    kept_active = [p for p in r["paths"] if p["status"] == "active"]
-    check("keep leaves exactly 1 active path", len(kept_active) == 1)
-    check("kept path is the one we chose", kept_active[0]["id"] == keep_pid)
-    check("keep marks cluster resolved", r["resolved"] is True)
+        ov2 = client.get("/api/overview").json()
+        check("purgatory grew by n-1", ov2["paths_purgatory"] == n_active_before - 1)
+        check("unresolved count dropped by 1", ov2["clusters_unresolved"] == n_truth_groups - 1)
 
-    ov2 = client.get("/api/overview").json()
-    check("purgatory grew by n-1", ov2["paths_purgatory"] == n_active_before - 1)
-    check("unresolved count dropped by 1", ov2["clusters_unresolved"] == n_truth_groups - 1)
+        # --- action 2: purge_all on the next cluster ---
+        c1 = clusters[1]
+        d1 = client.get(f"/api/clusters/{c1['id']}").json()
+        n1 = len([p for p in d1["paths"] if p["status"] == "active"])
+        r1 = client.post(f"/api/clusters/{c1['id']}/purge_all").json()
+        check("purge_all leaves 0 active", len([p for p in r1["paths"] if p["status"]=="active"]) == 0)
 
-    # --- action 2: purge_all on the next cluster ---
-    c1 = clusters[1]
-    d1 = client.get(f"/api/clusters/{c1['id']}").json()
-    n1 = len([p for p in d1["paths"] if p["status"] == "active"])
-    r1 = client.post(f"/api/clusters/{c1['id']}/purge_all").json()
-    check("purge_all leaves 0 active", len([p for p in r1["paths"] if p["status"]=="active"]) == 0)
+        ov3 = client.get("/api/overview").json()
+        check("purgatory grew by all of cluster 2",
+              ov3["paths_purgatory"] == (n_active_before - 1) + n1)
 
-    ov3 = client.get("/api/overview").json()
-    check("purgatory grew by all of cluster 2",
-          ov3["paths_purgatory"] == (n_active_before - 1) + n1)
+        # --- action 3: undo (reverses purge_all) ---
+        u = client.post("/api/undo").json()
+        check("undo reports purge_all", u["action"] == "purge_all")
+        d1b = client.get(f"/api/clusters/{c1['id']}").json()
+        check("undo restored all active paths",
+              len([p for p in d1b["paths"] if p["status"]=="active"]) == n1)
+        check("undo cleared resolved flag", d1b["resolved"] is False)
 
-    # --- action 3: undo (reverses purge_all) ---
-    u = client.post("/api/undo").json()
-    check("undo reports purge_all", u["action"] == "purge_all")
-    d1b = client.get(f"/api/clusters/{c1['id']}").json()
-    check("undo restored all active paths",
-          len([p for p in d1b["paths"] if p["status"]=="active"]) == n1)
-    check("undo cleared resolved flag", d1b["resolved"] is False)
+        # --- action 4: undo again (reverses the keep) ---
+        u2 = client.post("/api/undo").json()
+        check("second undo reports resolve_keep", u2["action"] == "resolve_keep")
+        ov4 = client.get("/api/overview").json()
+        check("fully undone: purgatory empty again", ov4["paths_purgatory"] == 0)
+        check("fully undone: all clusters unresolved again",
+              ov4["clusters_unresolved"] == n_truth_groups)
 
-    # --- action 4: undo again (reverses the keep) ---
-    u2 = client.post("/api/undo").json()
-    check("second undo reports resolve_keep", u2["action"] == "resolve_keep")
-    ov4 = client.get("/api/overview").json()
-    check("fully undone: purgatory empty again", ov4["paths_purgatory"] == 0)
-    check("fully undone: all clusters unresolved again",
-          ov4["clusters_unresolved"] == n_truth_groups)
-
-    # --- search ---
-    sr = client.get("/api/search", params={"q": "manuscript"}).json()["results"]
-    check("search finds manuscript paths", len(sr) > 0)
+        # --- search ---
+        sr = client.get("/api/search", params={"q": "manuscript"}).json()["results"]
+        check("search finds manuscript paths", len(sr) > 0)
 
     # --- re-ingest idempotency doesn't double-count clusters ---
     store2 = Store(db, same_thread=False)

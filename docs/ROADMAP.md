@@ -17,7 +17,7 @@ See [`midden_design.md`](midden_design.md) for the rationale behind these.
 - **Purgatory & undo** — virtual delete (status flip on `files`); default views exclude
   it; every action is reversible from the `decisions` log.
 - **Topic inference** — read the first chunk of each document and assign a topic tag
-  (Ollama / Anthropic / deterministic stub backends), then cluster by inferred project.
+  (local LAN LLM / Anthropic / deterministic stub backends), then cluster by inferred project.
 
 ## Next
 

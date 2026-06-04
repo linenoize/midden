@@ -550,17 +550,17 @@ async function loadProjects(){
     try{
       const h=await api("/api/topics/health");
       const sel=$("#topicBackend"); const opts=[];
-      if(h.ollama.available){
-        const n=h.ollama.models.length;
-        opts.push(["ollama",`ollama (${n} model${n===1?'':'s'})`]);
+      if(h.local.available){
+        const n=h.local.models.length;
+        opts.push(["local",`local LLM (${n} model${n===1?'':'s'})`]);
       }
       if(h.anthropic.available) opts.push(["anthropic","anthropic (cloud)"]);
       opts.push(["stub","stub (rule-based, offline)"]);
       sel.innerHTML=opts.map(([v,l])=>`<option value="${v}">${esc(l)}</option>`).join("");
       sel.value=h.default;
-      $("#topicBackendNote").textContent = h.ollama.available
-        ? "local model — file contents stay on this machine"
-        : "Ollama not detected — stub uses each doc's title heading, no model needed";
+      $("#topicBackendNote").textContent = h.local.available
+        ? "local LLM on the LAN — file contents stay on the local subnet"
+        : "local LLM not reachable — stub uses each doc's title heading, no model needed";
     }catch(e){ /* keep whatever the select has */ }
   }
   await renderProjects();

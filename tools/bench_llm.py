@@ -1,13 +1,15 @@
-"""Bench local Ollama models for phase-4 topic inference.
+"""Bench the LAN LLM models for phase-4 topic inference.
 
 Task: given the first chunk of a document, return a short topic tag + project
-guess as JSON (schema-constrained). We score on: does it return valid JSON
-matching the schema, is the tag sane, and how fast.
+guess as JSON. We score on: does it return valid JSON matching the schema, is
+the tag sane, and how fast.
 
-Uses the synthetic corpus's known doc topics (kitchen reno, the manuscript,
-generic notes) as a sanity check. Read-only, no deps beyond stdlib.
+Talks to the OpenAI-compatible server (llama.cpp + llama-swap on FIEF) via the
+same helpers the app uses — base URL / key resolve from $MIDDEN_LLM_BASE /
+$MIDDEN_LLM_API_KEY / the documented key file (see windows-sysadmin/CONNECT.md).
+Replaces the former Ollama bench. Read-only, no deps beyond stdlib + midden.
 
-Run:  python tools/bench_ollama.py
+Run:  python tools/bench_llm.py
 """
 from __future__ import annotations
 
@@ -15,27 +17,12 @@ import json
 import time
 import urllib.request
 
-OLLAMA = "http://localhost:11434/api/chat"
+from midden import topics
 
-CANDIDATES = ["llama3.2:latest", "llama3.1:8b", "qwen3.5:latest", "gemma4:e4b", "qwen3:1.7b"]
+# Model IDs on the new server (see CONNECT.md). Old Ollama names also resolve.
+CANDIDATES = ["llama3.2-3b", "llama3.1-8b", "qwen3.5", "gemma4-e4b", "qwen3-1.7b"]
 
-SCHEMA = {
-    "type": "object",
-    "properties": {
-        "topic": {"type": "string"},          # 1-3 word human topic
-        "slug": {"type": "string"},           # kebab-case tag
-        "kind": {"type": "string", "enum": ["document", "note", "receipt", "code", "other"]},
-        "confidence": {"type": "number"},
-    },
-    "required": ["topic", "slug", "kind", "confidence"],
-}
-
-SYSTEM = (
-    "You categorize a file by its content for a personal-archive organizer. "
-    "Return ONLY the JSON object. 'topic' is a 1-3 word human-readable subject. "
-    "'slug' is a kebab-case tag (lowercase, hyphens). Be concise and literal — "
-    "do not invent details not present in the text."
-)
+SYSTEM = topics.SYSTEM  # reuse the app's exact prompt so the bench stays representative
 
 # Representative samples: 2 from the corpus's real topics + 1 ambiguous.
 SAMPLES = {
@@ -65,11 +52,17 @@ def chat(model: str, text: str) -> tuple[dict | None, float, str]:
             {"role": "user", "content": f"Categorize this file:\n\n{text}"},
         ],
         "stream": False,
-        "format": SCHEMA,
-        "options": {"temperature": 0},
+        "temperature": 0,
+        "max_tokens": 512,
+        "response_format": {"type": "json_object"},
+        "chat_template_kwargs": {"enable_thinking": False},
     }
-    data = json.dumps(body).encode()
-    req = urllib.request.Request(OLLAMA, data=data, headers={"Content-Type": "application/json"})
+    headers = {"Content-Type": "application/json"}
+    key = topics.llm_api_key()
+    if key:
+        headers["Authorization"] = f"Bearer {key}"
+    req = urllib.request.Request(
+        topics._llm_chat(), data=json.dumps(body).encode(), headers=headers)
     t0 = time.time()
     try:
         with urllib.request.urlopen(req, timeout=120) as resp:
@@ -77,7 +70,8 @@ def chat(model: str, text: str) -> tuple[dict | None, float, str]:
     except Exception as e:
         return None, time.time() - t0, f"ERROR: {e}"
     dt = time.time() - t0
-    content = out.get("message", {}).get("content", "")
+    choices = out.get("choices") or []
+    content = (choices[0].get("message") or {}).get("content", "") if choices else ""
     try:
         return json.loads(content), dt, ""
     except json.JSONDecodeError:
@@ -85,7 +79,13 @@ def chat(model: str, text: str) -> tuple[dict | None, float, str]:
 
 
 def main() -> int:
-    print(f"benchmarking {len(CANDIDATES)} models on {len(SAMPLES)} samples\n")
+    print(f"endpoint: {topics.llm_base()}")
+    ok, models = topics.llm_available()
+    if not ok:
+        print("  LLM server not reachable — set MIDDEN_LLM_BASE / MIDDEN_LLM_API_KEY")
+        return 1
+    print(f"  available models: {', '.join(models) or 'none'}")
+    print(f"\nbenchmarking {len(CANDIDATES)} models on {len(SAMPLES)} samples\n")
     results = {}
     for model in CANDIDATES:
         print(f"=== {model} ===")
