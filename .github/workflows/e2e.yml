@@ -40,7 +40,7 @@ jobs:
           # e2e_archive lists .zip natively; it self-skips the 7z/rar backend if
           # no 7z CLI is on the runner (GitHub ubuntu images ship one).
           for t in review near purgatory ingest_ui topics \
-                   shortread near_image repair explain adversarial archive; do
+                   shortread near_image repair explain adversarial archive organize; do
             echo "::group::e2e_$t"
             python tools/e2e_$t.py
             echo "::endgroup::"

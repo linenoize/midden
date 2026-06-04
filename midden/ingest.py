@@ -39,6 +39,23 @@ except ImportError:
 _FILE_ATTRIBUTE_REPARSE_POINT = 0x400  # Windows junctions / mount points
 
 
+def _under_any(p: Path, roots: list[Path]) -> bool:
+    """True if `p` resolves at or below any root in `roots`."""
+    if not roots:
+        return False
+    try:
+        rp = p.resolve()
+    except OSError:
+        return False
+    for r in roots:
+        try:
+            rp.relative_to(r)
+            return True
+        except ValueError:
+            continue
+    return False
+
+
 def is_reparse_point(p: Path) -> bool:
     """True if `p` is a symlink or (Windows) a junction / reparse point.
 
@@ -159,6 +176,11 @@ def ingest(
     drive = get_or_create(root, label=label)
     store.upsert_drive(drive.id, drive.label, drive.root_path)
 
+    # Managed roots (organize destinations + holding folder) are NEVER walked —
+    # they may live inside this scanned drive, and re-discovering relocated files
+    # there would rebuild the exact-dup groups the user just resolved.
+    managed_roots = [Path(r).resolve() for r in store.managed_drive_roots()]
+
     stats = IngestStats()
     started = time.time()
     run_started = int(started)  # epoch boundary for --prune (observed_at < this)
@@ -187,9 +209,15 @@ def ingest(
                 if is_reparse_point(dpath):
                     stats.files_skipped_symlink += 1
                     yield IngestEvent(kind="skipped_symlink", path=str(dpath))
+                elif _under_any(dpath, managed_roots):
+                    continue  # managed dest/holding subtree — never ingest
                 else:
                     kept.append(d)
             dirnames[:] = kept
+        # If the scan root itself is a managed folder, skip its files too (the
+        # dirname pruning above only protects descendants, not the current dir).
+        if _under_any(Path(dirpath), managed_roots):
+            continue
         for name in filenames:
             if name in skip_names:
                 continue

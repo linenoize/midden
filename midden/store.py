@@ -8,6 +8,7 @@ This is the ONLY module that touches the schema.
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import threading
 import time
@@ -34,7 +35,8 @@ CREATE TABLE IF NOT EXISTS drives (
   id                TEXT PRIMARY KEY,
   label             TEXT,
   root_path         TEXT,
-  last_ingested_at  INTEGER
+  last_ingested_at  INTEGER,
+  kind              TEXT NOT NULL DEFAULT 'scanned'  -- scanned | managed
 );
 
 CREATE TABLE IF NOT EXISTS paths (
@@ -93,6 +95,36 @@ CREATE TABLE IF NOT EXISTS decisions (
   action        TEXT NOT NULL,    -- mark_canonical | send_to_purgatory | tag | undo | ...
   payload_json  TEXT NOT NULL     -- enough to fully reverse
 );
+
+-- Small key/value config travelling with the index (JSON values). Holds the
+-- organize destinations, the holding folder, and review highlight patterns.
+CREATE TABLE IF NOT EXISTS settings (
+  key    TEXT PRIMARY KEY,
+  value  TEXT NOT NULL
+);
+
+-- Queue of physical file relocations to be executed by organize.py during the
+-- `process` step. Each row is a two-phase op: 'pending' -> 'moving' (source/dest
+-- resolved + committed BEFORE the OS move) -> 'executed' (after the move + index
+-- update). The 'moving' state is what makes a crash recoverable. kind='keeper'
+-- (a kept file going to a destination) or 'dup' (a purgatory file going to the
+-- holding folder).
+CREATE TABLE IF NOT EXISTS pending_moves (
+  id           INTEGER PRIMARY KEY AUTOINCREMENT,
+  path_id      INTEGER NOT NULL,                    -- live paths.id (no FK: rows are
+                                                    -- relocated/deleted during execute;
+                                                    -- full reversal data is in decisions)
+  hash         TEXT NOT NULL,
+  kind         TEXT NOT NULL,                       -- keeper | dup
+  dest_label   TEXT,
+  dest_root    TEXT NOT NULL,                       -- absolute destination/holding root
+  src_abspath  TEXT,                                -- resolved at 'moving' time (crash recovery)
+  final_path   TEXT,                                -- actual mirrored rel path under dest_root after move
+  enqueued_at  INTEGER NOT NULL,
+  status       TEXT NOT NULL DEFAULT 'pending'      -- pending | moving | executed | canceled
+);
+CREATE INDEX IF NOT EXISTS idx_pending_status ON pending_moves(status);
+CREATE INDEX IF NOT EXISTS idx_pending_path ON pending_moves(path_id);
 """
 
 
@@ -156,6 +188,12 @@ class Store:
             self.conn.execute("ALTER TABLE signatures ADD COLUMN w INTEGER")
         if "h" not in sig_cols:
             self.conn.execute("ALTER TABLE signatures ADD COLUMN h INTEGER")
+        # Managed drives (organize destinations / holding folder) vs scanned ones.
+        drive_cols = {r["name"] for r in self.conn.execute("PRAGMA table_info(drives)")}
+        if "kind" not in drive_cols:
+            self.conn.execute(
+                "ALTER TABLE drives ADD COLUMN kind TEXT NOT NULL DEFAULT 'scanned'"
+            )
 
     @contextmanager
     def tx(self) -> Iterator[sqlite3.Connection]:
@@ -285,12 +323,12 @@ class Store:
     # ---------- drives & reconciliation ----------
     def list_drives(self) -> list[sqlite3.Row]:
         return self.conn.execute(
-            "SELECT id, label, root_path, last_ingested_at FROM drives ORDER BY label"
+            "SELECT id, label, root_path, last_ingested_at, kind FROM drives ORDER BY label"
         ).fetchall()
 
     def get_drive(self, drive_id: str) -> Optional[sqlite3.Row]:
         return self.conn.execute(
-            "SELECT id, label, root_path, last_ingested_at FROM drives WHERE id=?",
+            "SELECT id, label, root_path, last_ingested_at, kind FROM drives WHERE id=?",
             (drive_id,),
         ).fetchone()
 
@@ -892,8 +930,15 @@ class Store:
             "SELECT canonical_hash, status FROM clusters WHERE id=?", (cluster_id,)
         ).fetchone()
 
-    def resolve_keep(self, cluster_id: int, keep_path_id: int) -> dict:
-        """Keep one path; send every other active path in the cluster to purgatory."""
+    def resolve_keep(self, cluster_id: int, keep_path_id: int,
+                     move_dest: Optional[dict] = None) -> dict:
+        """Keep one path; send every other active path in the cluster to purgatory.
+
+        If `move_dest` ({label, path}) is given, the kept file is ALSO queued (a
+        pending_moves row) to be physically relocated to that destination during
+        the `process` step. Queuing is index-only and fully reversible by undo —
+        no file is touched here.
+        """
         with self._lock:
             actives = self._active_member_paths(cluster_id)
             if not actives:
@@ -905,6 +950,7 @@ class Store:
             prev = self._cluster_state(cluster_id)
             purged = [{"id": r["id"], "prev_status": "active"}
                       for r in actives if r["id"] != keep_path_id]
+            move_id = None
             with self.tx():
                 for p in purged:
                     self.conn.execute("UPDATE paths SET status='purgatory' WHERE id=?", (p["id"],))
@@ -912,9 +958,13 @@ class Store:
                     "UPDATE clusters SET canonical_hash=?, status='resolved' WHERE id=?",
                     (keep_hash, cluster_id),
                 )
+                if move_dest and move_dest.get("path"):
+                    move_id = self.enqueue_move(
+                        keep_path_id, keep_hash, "keeper",
+                        move_dest.get("label"), move_dest["path"])
                 self._record_decision("resolve_keep", {
                     "cluster_id": cluster_id, "kept_path_id": keep_path_id,
-                    "purged": purged,
+                    "purged": purged, "pending_move_id": move_id,
                     "prev_canonical": prev["canonical_hash"], "prev_status": prev["status"],
                 })
             return self.get_cluster(cluster_id)
@@ -939,8 +989,18 @@ class Store:
                 })
             return self.get_cluster(cluster_id)
 
+    # Decisions whose reversal moves files on disk — never reversed by the fast
+    # index-only `u` keystroke (undo_last); handled by organize.undo_last_process.
+    _DISK_OP_ACTIONS = ("apply_move", "apply_remove")
+
     def undo_last(self) -> Optional[dict]:
-        """Reverse the most recent not-yet-undone decision. Append-only."""
+        """Reverse the most recent not-yet-undone *index-only* decision.
+
+        If the most recent decision is a physical relocation (apply_move /
+        apply_remove), this refuses and returns a {needs_process_undo} signal —
+        reversing a committed move touches the disk and must go through
+        organize.undo_last_process, not a keystroke. Append-only.
+        """
         with self._lock:
             row = self.conn.execute(
                 """
@@ -955,6 +1015,9 @@ class Store:
             ).fetchone()
             if not row:
                 return None
+            if row["action"] in self._DISK_OP_ACTIONS:
+                return {"needs_process_undo": True, "decision_id": row["id"],
+                        "action": row["action"]}
             payload = json.loads(row["payload_json"])
             with self.tx():
                 if row["action"] in ("resolve_keep", "purge_all"):
@@ -966,6 +1029,12 @@ class Store:
                         (payload.get("prev_canonical"), payload.get("prev_status", "open"),
                          payload["cluster_id"]),
                     )
+                    # un-queue a keeper move that was enqueued with this keep
+                    pmid = payload.get("pending_move_id")
+                    if pmid:
+                        self.conn.execute(
+                            "UPDATE pending_moves SET status='canceled' "
+                            "WHERE id=? AND status='pending'", (pmid,))
                 elif row["action"] == "restore":
                     # reverse a targeted restore: re-purge the path, re-resolve clusters
                     self.conn.execute(
@@ -1012,12 +1081,22 @@ class Store:
         """
         with self._lock:
             row = self.conn.execute(
-                "SELECT id, hash, status FROM paths WHERE id=?", (path_id,)
+                """
+                SELECT p.id, p.hash, p.status, d.kind AS drive_kind
+                FROM paths p JOIN drives d ON d.id=p.drive_id WHERE p.id=?
+                """, (path_id,)
             ).fetchone()
             if row is None:
                 raise ValueError(f"No such path: {path_id}")
             if row["status"] != "purgatory":
                 raise ValueError(f"path {path_id} is not in purgatory")
+            if row["drive_kind"] == "managed":
+                # File already physically relocated to the holding folder — a plain
+                # index flip would point 'active' at the holding copy, not the
+                # original. Reversing that is a disk op: use "undo last process".
+                raise ValueError(
+                    f"path {path_id} was moved to the holding folder; use "
+                    f"'undo last process' or restore it from holding manually")
             h = row["hash"]
             reopened = []
             for cr in self.conn.execute(
@@ -1045,6 +1124,247 @@ class Store:
                 })
             return {"restored_path_id": path_id,
                     "reopened_clusters": [r["cluster_id"] for r in reopened]}
+
+    # ---------- settings (JSON key/value config travelling with the index) ----------
+    def get_setting(self, key: str, default=None):
+        r = self.conn.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+        return json.loads(r["value"]) if r else default
+
+    def set_setting(self, key: str, value) -> None:
+        with self._lock:
+            self.conn.execute(
+                "INSERT INTO settings(key, value) VALUES (?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (key, json.dumps(value)),
+            )
+
+    def get_destinations(self) -> list[dict]:
+        """List of {label, path} the user can move keepers to (max 5, enforced by UI)."""
+        return self.get_setting("destinations", []) or []
+
+    def set_destinations(self, dests: list[dict]) -> None:
+        self.set_setting("destinations", dests)
+
+    def get_highlight_patterns(self) -> list[str]:
+        return self.get_setting("highlight_patterns", []) or []
+
+    def set_highlight_patterns(self, patterns: list[str]) -> None:
+        self.set_setting("highlight_patterns", patterns)
+
+    def get_holding_dir(self) -> Optional[str]:
+        return self.get_setting("holding_dir", None)
+
+    def set_holding_dir(self, path: Optional[str]) -> None:
+        self.set_setting("holding_dir", path)
+
+    # ---------- managed drives (organize destinations / holding folder) ----------
+    # A managed drive is a synthetic `drives` row whose root is a user destination
+    # or the holding folder. Unlike scanned drives it carries NO .midden_drive.json
+    # marker (we never write into the user's target folders) and is NEVER walked by
+    # ingest or touched by reconcile — that's what lets destinations live inside an
+    # already-scanned disk without re-discovering relocated files (design: managed
+    # subtrees are skipped).
+    @staticmethod
+    def managed_drive_id(root_path: str) -> str:
+        """Deterministic id for a managed root, so re-ensuring the same folder is
+        idempotent. Derived from the normalized absolute path (no marker file)."""
+        import hashlib as _h
+        norm = os.path.normcase(os.path.abspath(root_path))
+        return "managed:" + _h.sha256(norm.encode("utf-8")).hexdigest()[:16]
+
+    def ensure_managed_drive(self, root_path: str, label: Optional[str] = None) -> str:
+        """Insert (idempotently) a managed drive row for `root_path`; return its id."""
+        abspath = os.path.abspath(root_path)
+        did = self.managed_drive_id(abspath)
+        now = int(time.time())
+        with self._lock:
+            self.conn.execute(
+                "INSERT INTO drives(id, label, root_path, last_ingested_at, kind) "
+                "VALUES (?, ?, ?, ?, 'managed') "
+                "ON CONFLICT(id) DO UPDATE SET root_path=excluded.root_path, "
+                "label=COALESCE(excluded.label, drives.label)",
+                (did, label or Path(abspath).name, abspath, now),
+            )
+        return did
+
+    def managed_drive_roots(self) -> list[str]:
+        """Absolute roots of all managed drives (for ingest/reconcile skip checks)."""
+        return [r["root_path"] for r in self.conn.execute(
+            "SELECT root_path FROM drives WHERE kind='managed' AND root_path IS NOT NULL")]
+
+    def drive_kind(self, drive_id: str) -> Optional[str]:
+        r = self.conn.execute("SELECT kind FROM drives WHERE id=?", (drive_id,)).fetchone()
+        return r["kind"] if r else None
+
+    # ---------- pending-move queue (executed by organize.py) ----------
+    def path_full(self, path_id: int) -> Optional[dict]:
+        """Full row for a path id with its drive root + kind + absolute path."""
+        r = self.conn.execute(
+            """
+            SELECT p.id, p.hash, p.drive_id, p.path, p.mtime, p.ctime, p.status,
+                   d.root_path AS root_path, d.kind AS drive_kind
+            FROM paths p JOIN drives d ON d.id=p.drive_id
+            WHERE p.id=?
+            """,
+            (path_id,),
+        ).fetchone()
+        if not r:
+            return None
+        d = dict(r)
+        d["abspath"] = (str(Path(r["root_path"]) / r["path"]) if r["root_path"] else r["path"])
+        return d
+
+    def enqueue_move(self, path_id: int, hash_: str, kind: str,
+                     dest_label: Optional[str], dest_root: str) -> int:
+        """Queue a relocation. Caller holds the write context when batching."""
+        cur = self.conn.execute(
+            "INSERT INTO pending_moves(path_id, hash, kind, dest_label, dest_root, "
+            "enqueued_at, status) VALUES (?, ?, ?, ?, ?, ?, 'pending')",
+            (path_id, hash_, kind, dest_label, dest_root, int(time.time())),
+        )
+        return cur.lastrowid
+
+    def pending_for_path(self, path_id: int, statuses=("pending", "moving", "executed")) -> list[dict]:
+        ph = ",".join("?" * len(statuses))
+        return [dict(r) for r in self.conn.execute(
+            f"SELECT * FROM pending_moves WHERE path_id=? AND status IN ({ph})",
+            (path_id, *statuses))]
+
+    def list_pending(self, kind: Optional[str] = None,
+                     statuses=("pending",)) -> list[dict]:
+        """Pending-move rows joined with path/drive info, for the Process view."""
+        ph = ",".join("?" * len(statuses))
+        q = (f"SELECT pm.*, p.path AS rel, p.status AS path_status, f.size AS size, "
+             f"d.root_path AS src_root, d.label AS src_drive_label "
+             f"FROM pending_moves pm "
+             f"JOIN paths p ON p.id=pm.path_id "
+             f"JOIN files f ON f.hash=pm.hash "
+             f"JOIN drives d ON d.id=p.drive_id "
+             f"WHERE pm.status IN ({ph})")
+        params: list = list(statuses)
+        if kind:
+            q += " AND pm.kind=?"
+            params.append(kind)
+        q += " ORDER BY f.size DESC"
+        return [dict(r) for r in self.conn.execute(q, params)]
+
+    def cancel_pending_move(self, pending_id: int) -> None:
+        with self._lock:
+            self.conn.execute(
+                "UPDATE pending_moves SET status='canceled' WHERE id=? AND status='pending'",
+                (pending_id,))
+
+    def set_move_moving(self, pending_id: int, src_abspath: str, final_rel: str) -> None:
+        """Persist resolved source + planned dest rel, flip to 'moving' BEFORE the
+        OS move. Storing the exact planned dest makes a crash recoverable: recovery
+        probes src_abspath and dest_root/final_path on disk to decide what happened."""
+        with self._lock, self.tx():
+            self.conn.execute(
+                "UPDATE pending_moves SET status='moving', src_abspath=?, final_path=? WHERE id=?",
+                (src_abspath, final_rel, pending_id))
+
+    def moving_rows(self) -> list[dict]:
+        """Rows stuck mid-move (crash recovery probes disk for these)."""
+        return [dict(r) for r in self.conn.execute(
+            "SELECT * FROM pending_moves WHERE status='moving'")]
+
+    def revert_move_to_pending(self, pending_id: int) -> None:
+        with self._lock, self.tx():
+            self.conn.execute(
+                "UPDATE pending_moves SET status='pending', src_abspath=NULL WHERE id=?",
+                (pending_id,))
+
+    def dup_candidates(self) -> list[dict]:
+        """Purgatory paths still on SCANNED drives (i.e. not yet moved to holding).
+        These are the 'to remove' work list for the process step."""
+        rows = self.conn.execute(
+            """
+            SELECT p.id AS path_id, p.hash AS hash, p.path AS rel, f.size AS size,
+                   d.root_path AS src_root, d.label AS src_drive_label
+            FROM paths p JOIN files f ON f.hash=p.hash
+            JOIN drives d ON d.id=p.drive_id
+            WHERE p.status='purgatory' AND d.kind='scanned'
+            ORDER BY f.size DESC
+            """
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def commit_relocation(self, pending_id: int, src_path_id: int,
+                          dest_drive_id: str, dest_rel: str, mtime: int, ctime: int,
+                          new_status: str, decision_action: str) -> int:
+        """DB side of a completed physical move (organize.py calls this AFTER the
+        OS move succeeds). Inserts the destination path row, deletes the source
+        row, marks the pending row executed, and snapshots a reversible decision.
+        Pure-DB: no filesystem access here (store stays the DB-only boundary)."""
+        with self._lock:
+            src = self.conn.execute(
+                "SELECT hash, drive_id, path, mtime, ctime, status FROM paths WHERE id=?",
+                (src_path_id,)).fetchone()
+            if src is None:
+                raise ValueError(f"source path {src_path_id} vanished from index")
+            now = int(time.time())
+            with self.tx():
+                cur = self.conn.execute(
+                    "INSERT INTO paths(hash, drive_id, path, mtime, ctime, observed_at, status) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (src["hash"], dest_drive_id, dest_rel, mtime, ctime, now, new_status))
+                new_path_id = cur.lastrowid
+                self.conn.execute("DELETE FROM paths WHERE id=?", (src_path_id,))
+                # point the executed queue row at the live destination row
+                self.conn.execute(
+                    "UPDATE pending_moves SET status='executed', final_path=?, path_id=? WHERE id=?",
+                    (dest_rel, new_path_id, pending_id))
+                self._record_decision(decision_action, {
+                    "pending_id": pending_id,
+                    "new_path_id": new_path_id, "new_status": new_status,
+                    "src": {"hash": src["hash"], "drive_id": src["drive_id"],
+                            "path": src["path"], "mtime": src["mtime"],
+                            "ctime": src["ctime"], "status": src["status"]},
+                    "dest": {"drive_id": dest_drive_id, "path": dest_rel},
+                })
+            return new_path_id
+
+    def reverse_relocation(self, decision_id: int) -> dict:
+        """DB side of undoing an executed move (organize.py moves the file back
+        first, then calls this). Re-inserts the original source row, deletes the
+        destination row, flips the pending row back to 'pending'. Records an undo."""
+        with self._lock:
+            d = self.conn.execute(
+                "SELECT action, payload_json FROM decisions WHERE id=?", (decision_id,)).fetchone()
+            if d is None or d["action"] not in ("apply_move", "apply_remove"):
+                raise ValueError(f"decision {decision_id} is not a reversible relocation")
+            p = json.loads(d["payload_json"])
+            src, now = p["src"], int(time.time())
+            with self.tx():
+                self.conn.execute("DELETE FROM paths WHERE id=?", (p["new_path_id"],))
+                cur = self.conn.execute(
+                    "INSERT INTO paths(hash, drive_id, path, mtime, ctime, observed_at, status) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (src["hash"], src["drive_id"], src["path"], src["mtime"],
+                     src["ctime"], now, src["status"]))
+                # re-point the queue row at the re-inserted source so a later
+                # re-process targets the live row, and clear the in-flight state
+                self.conn.execute(
+                    "UPDATE pending_moves SET status='pending', src_abspath=NULL, "
+                    "final_path=NULL, path_id=? WHERE id=?", (cur.lastrowid, p["pending_id"]))
+                self._record_decision("undo", {"target": decision_id, "of_action": d["action"]})
+            return {"reversed_decision_id": decision_id, "action": d["action"],
+                    "src": src, "dest": p["dest"]}
+
+    def last_executed_relocation(self) -> Optional[dict]:
+        """Most recent not-yet-undone apply_move/apply_remove decision (for
+        'undo last process')."""
+        row = self.conn.execute(
+            """
+            SELECT id, action, payload_json FROM decisions
+            WHERE action IN ('apply_move','apply_remove')
+              AND id NOT IN (
+                SELECT CAST(json_extract(payload_json,'$.target') AS INTEGER)
+                FROM decisions WHERE action='undo')
+            ORDER BY id DESC LIMIT 1
+            """
+        ).fetchone()
+        return dict(row) if row else None
 
     # ---------- search ----------
     def search(self, q: str, include_purgatory: bool = False, limit: int = 200) -> list[dict]:

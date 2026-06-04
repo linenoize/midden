@@ -7,6 +7,8 @@ Usage:
     python -m midden.cli dups      [--db PATH] [--min-size N] [--json]
     python -m midden.cli cluster   [--db PATH]             # exact + near-dup detection
     python -m midden.cli topics    [--db PATH] [--backend auto|stub|local|anthropic] [--llm-url URL]
+    python -m midden.cli config    [--db PATH] [--add-dest [LABEL=]PATH] [--holding DIR] [--add-highlight FRAG]
+    python -m midden.cli process   [--db PATH] [--dry-run] [--no-verify]
     python -m midden.cli serve     [--db PATH] [--host H] [--port N] [--allow-remote] [--skip-materialize]
 """
 from __future__ import annotations
@@ -200,6 +202,73 @@ def cmd_topics(args) -> int:
     return 0
 
 
+def cmd_config(args) -> int:
+    """Show or set organize settings (destinations, holding folder, highlights)."""
+    store = Store(args.db)
+    if args.add_dest:
+        label, _, path = args.add_dest.partition("=")
+        if not path:
+            label, path = None, args.add_dest
+        dests = store.get_destinations()
+        if len(dests) >= 5:
+            print("[config] already have 5 destinations; remove one first", file=sys.stderr)
+            store.close()
+            return 1
+        dests.append({"label": (label or None), "path": path})
+        store.set_destinations(dests)
+        store.ensure_managed_drive(path, label or None)
+    if args.clear_dest:
+        store.set_destinations([])
+    if args.holding:
+        store.set_holding_dir(args.holding)
+        store.ensure_managed_drive(args.holding, "holding")
+    if args.add_highlight:
+        pats = store.get_highlight_patterns()
+        pats.append(args.add_highlight)
+        store.set_highlight_patterns(pats)
+    if args.clear_highlights:
+        store.set_highlight_patterns([])
+
+    print("[config] destinations:")
+    for i, d in enumerate(store.get_destinations(), 1):
+        print(f"  {i}. {d.get('label') or '(no label)'} -> {d['path']}")
+    print(f"[config] holding folder: {store.get_holding_dir() or '(unset)'}")
+    print(f"[config] highlight patterns: {store.get_highlight_patterns() or '(none)'}")
+    store.close()
+    return 0
+
+
+def cmd_process(args) -> int:
+    """Execute (or preview) queued keeper moves + dup removals to the holding folder."""
+    from . import organize
+    store = Store(args.db, same_thread=False)
+    moved = skipped = 0
+    for ev in organize.process(store, dry_run=args.dry_run, verify=not args.no_verify):
+        k = ev.get("kind")
+        if k == "started":
+            mode = "DRY-RUN" if ev["dry_run"] else "PROCESS"
+            print(f"[{mode}] {ev['total']} relocation(s): {ev['keepers']} keeper(s), "
+                  f"{ev['dups']} dup(s) -> holding {ev.get('holding')}")
+        elif k == "planned":
+            print(f"  would move ({ev['kind2']}) {ev['path']} -> {ev['dest_root']}/{ev['dest_rel']}")
+        elif k == "moved":
+            moved += 1
+            print(f"  moved ({ev['kind2']}) {ev['path']} -> {ev['dest_root']}/{ev['dest_rel']}")
+        elif k == "conflict":
+            skipped += 1
+            print(f"  SKIP {ev.get('path')}: {ev['reason']}", file=sys.stderr)
+        elif k == "error":
+            print(f"  ERROR {ev.get('path','')}: {ev['error']}", file=sys.stderr)
+            if ev.get("fatal"):
+                store.close()
+                return 1
+        elif k == "done":
+            print(f"[process] moved={ev['moved']} skipped={ev['skipped']} "
+                  f"(dry_run={ev['dry_run']})")
+    store.close()
+    return 0
+
+
 def cmd_serve(args) -> int:
     from .server import serve
     serve(args.db, host=args.host, port=args.port, allow_remote=args.allow_remote,
@@ -259,6 +328,25 @@ def main(argv=None) -> int:
     p_tp.add_argument("--limit", type=int, default=0, help="cap docs processed (0 = all)")
     p_tp.add_argument("--quiet", action="store_true")
     p_tp.set_defaults(func=cmd_topics)
+
+    p_cfg = sub.add_parser("config", help="show/set organize destinations + holding folder")
+    p_cfg.add_argument("--add-dest", metavar="[LABEL=]PATH",
+                       help="add a move destination, e.g. --add-dest '3d=D:/3d-nodupe'")
+    p_cfg.add_argument("--clear-dest", action="store_true", help="remove all destinations")
+    p_cfg.add_argument("--holding", metavar="DIR",
+                       help="set the holding folder dups are moved to on process")
+    p_cfg.add_argument("--add-highlight", metavar="FRAGMENT",
+                       help="add a keeper path fragment to highlight in review")
+    p_cfg.add_argument("--clear-highlights", action="store_true")
+    p_cfg.set_defaults(func=cmd_config)
+
+    p_proc = sub.add_parser("process",
+                            help="move queued keepers to destinations + dups to holding")
+    p_proc.add_argument("--dry-run", action="store_true",
+                        help="preview the moves without touching any file")
+    p_proc.add_argument("--no-verify", action="store_true",
+                        help="skip re-hashing each source before moving (still checks size+mtime)")
+    p_proc.set_defaults(func=cmd_process)
 
     p_srv = sub.add_parser("serve", help="run the cluster-review web UI")
     p_srv.add_argument("--host", default="127.0.0.1")

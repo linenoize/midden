@@ -106,6 +106,36 @@
   }
   .empty { color:var(--dim); text-align:center; padding:60px 0; }
 
+  /* move-to-destination chips + keeper highlight in review */
+  .moveopts { display:flex; gap:6px; flex-wrap:wrap; flex:none; }
+  .movechip {
+    background:var(--panel); color:var(--dim); border:1px dashed var(--line);
+    border-radius:6px; padding:3px 8px; font:inherit; font-size:11px; cursor:pointer; flex:none;
+  }
+  .movechip:hover { border-color:var(--accent); color:var(--ink); }
+  .movechip.on { border-style:solid; border-color:var(--keep); color:var(--keep); background:#1c2a1c; }
+  .p.willmove { border-color:var(--keep); }
+  .p.keeper-match { border-left:3px solid var(--warn); }
+  .p.keeper-match .path::after { content:" ★"; color:var(--warn); }
+
+  /* process panel (purgatory) */
+  .proc-panel { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:14px 16px; margin-bottom:16px; }
+  .proc-row { display:flex; gap:18px; flex-wrap:wrap; align-items:center; margin-bottom:10px; }
+  .proc-q b { color:var(--keep); } .proc-q.dup b { color:var(--bad); }
+  .proc-log { font-size:12px; color:var(--dim); max-height:220px; overflow:auto; margin-top:8px; white-space:pre-wrap; }
+  .warnote { color:var(--warn); }
+
+  /* settings */
+  .set-block { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:16px; margin-bottom:16px; }
+  .set-block h2 { font-size:14px; margin:0 0 10px; }
+  .destrow { display:flex; gap:8px; margin-bottom:8px; }
+  .destrow input, .set-block textarea, .set-block input[type=text] {
+    background:var(--panel2); border:1px solid var(--line); color:var(--ink);
+    padding:8px 10px; border-radius:7px; font:inherit;
+  }
+  .destrow .lbl { width:200px; } .destrow .pth { flex:1; }
+  .set-block textarea { width:100%; min-height:80px; resize:vertical; }
+
   /* search */
   .searchbar { display:flex; gap:10px; margin-bottom:14px; }
   .searchbar input[type=text] {
@@ -171,6 +201,7 @@
     <button data-view="projects">Projects</button>
     <button data-view="search">Search</button>
     <button data-view="purgatory">Purgatory</button>
+    <button data-view="settings">Settings</button>
   </nav>
   <div class="spacer"></div>
   <div class="hint" id="globalHint"></div>
@@ -260,9 +291,30 @@
   <section class="view" id="view-purgatory">
     <div class="queue-meta">
       <span id="purgMeta">—</span>
-      <span class="hint">nothing here is deleted — restore returns a copy to the active set</span>
+      <span class="hint">queued review actions live here — <b>process</b> moves keepers to their destination and dups into the holding folder (reversible)</span>
     </div>
+    <div class="proc-panel" id="procPanel"></div>
     <div id="purgBody"></div>
+  </section>
+
+  <section class="view" id="view-settings">
+    <div class="set-block">
+      <h2>Move destinations <span class="hint">— up to 5; where “keep + move” sends the survivor</span></h2>
+      <div id="destRows"></div>
+      <button class="act" id="addDest">+ add destination</button>
+    </div>
+    <div class="set-block">
+      <h2>Holding folder <span class="hint">— where duplicates are moved when you process (your reversible trash)</span></h2>
+      <input type="text" id="holdingDir" placeholder="absolute path, e.g. D:/midden-holding" />
+    </div>
+    <div class="set-block">
+      <h2>Highlight patterns <span class="hint">— one path fragment per line; matching review rows get a ★</span></h2>
+      <textarea id="highlightPats" placeholder="New Structure/Personal/Developing - Creative"></textarea>
+    </div>
+    <div class="actions">
+      <button class="act" id="saveSettings">Save settings</button>
+      <span class="hint" id="settingsNote"></span>
+    </div>
   </section>
 </main>
 
@@ -299,8 +351,23 @@ const showView = v => {
   if (v==="projects") loadProjects();
   if (v==="search") $("#q").focus();
   if (v==="purgatory") loadPurgatory();
+  if (v==="settings") loadSettings();
 };
 document.querySelectorAll("nav button").forEach(b=>b.onclick=()=>showView(b.dataset.view));
+
+// ---- organize settings (destinations, holding folder, highlight patterns) ----
+let settings = {destinations:[], holding_dir:null, highlight_patterns:[], max_destinations:5};
+let settingsLoaded = false, moveSel = null;
+async function loadSettings(){
+  try { settings = await api("/api/settings"); settingsLoaded = true; }
+  catch(e){ /* keep defaults */ }
+  if (current==="settings") renderSettingsForm();
+}
+const normPath = s => (s||"").replace(/\\/g,"/").toLowerCase();
+const matchesHighlight = path => {
+  const np = normPath(path);
+  return (settings.highlight_patterns||[]).some(p=>p && np.includes(normPath(p)));
+};
 
 // ---- overview ----
 async function loadOverview(){
@@ -410,6 +477,7 @@ $("#ingestAnother").onclick=()=>{
 // ---- review queue ----
 let queue = [], qi = 0, currentCluster = null;
 async function loadQueue(){
+  if (!settingsLoaded) await loadSettings();  // chips + highlight need destinations/patterns
   // dedup kinds only — topic clusters are non-destructive groupings (Projects tab)
   // min_reclaimable hides trivially-tiny exact-dup groups (sub-1MiB) that would
   // otherwise bury the high-value duplicates; near_image/doc_version unaffected.
@@ -431,6 +499,7 @@ async function renderCluster(){
   const meta = queue[qi];
   const c = await api("/api/clusters/"+meta.id);
   currentCluster = c;
+  moveSel = null;   // destination selection is per-cluster
   $("#qPos").textContent = `${qi+1} / ${queue.length}`;
   const actives = c.paths.filter(p=>p.status==="active");
   const multi = c.kind !== "exact";   // doc_version / near_image span distinct hashes
@@ -462,10 +531,18 @@ async function renderCluster(){
       ? `<img class="thumb" src="/api/thumb/${p.hash}" loading="lazy" alt="" onerror="this.style.visibility='hidden'">` : "";
     const archBtn = isArchiveName(p.path)
       ? `<button class="arch-btn" data-arch="${p.id}" title="list archive contents (read-only)">📦 inside</button>` : "";
-    return `<div class="p ${p.status==='purgatory'?'purged':''}" data-pid="${p.id}" data-keep="${p.status==='active'}">
+    const active = p.status==="active";
+    const hl = (active && matchesHighlight(p.path)) ? " keeper-match" : "";
+    // destination chips: keep this copy AND queue it to move to that destination
+    const chips = (active && (settings.destinations||[]).length)
+      ? `<div class="moveopts">${settings.destinations.map((d,di)=>
+          `<button class="movechip" data-pid="${p.id}" data-di="${di}" `+
+          `title="keep this & move to ${esc(d.path)}">→ ${esc(d.label||d.path)}</button>`).join("")}</div>`
+      : "";
+    return `<div class="p ${p.status==='purgatory'?'purged':''}${hl}" data-pid="${p.id}" data-keep="${active}">
       <div class="idx">${activeIdx??"·"}</div>${thumb}
       <div style="flex:1"><div class="path">${esc(p.path)}</div>${meta}</div>
-      ${archBtn}${badge}</div><div class="arch" id="arch-${p.id}"></div>`;
+      ${chips}${archBtn}${badge}</div><div class="arch" id="arch-${p.id}"></div>`;
   }).join("");
   const sub = multi
     ? `${c.n_active} ${c.n_active===1?KIND.noun:KIND.nouns} · ${fmtBytes(c.reclaimable)} reclaimable`
@@ -487,6 +564,18 @@ async function renderCluster(){
   // archive "peek inside" — stop propagation so it doesn't trigger keep
   document.querySelectorAll(".arch-btn[data-arch]").forEach(el=>{
     el.onclick=e=>{ e.stopPropagation(); toggleArchive(parseInt(el.dataset.arch)); };
+  });
+  // destination chips — pick at most one across the cluster (radio-like)
+  document.querySelectorAll(".movechip").forEach(el=>{
+    el.onclick=e=>{
+      e.stopPropagation();  // don't also trigger keep on the row
+      const pid=parseInt(el.dataset.pid), di=parseInt(el.dataset.di);
+      const same = moveSel && moveSel.pid===pid && moveSel.di===di;
+      moveSel = same ? null : {pid, di, dest:settings.destinations[di]};
+      document.querySelectorAll(".movechip").forEach(c=>c.classList.remove("on"));
+      document.querySelectorAll(".p").forEach(r=>r.classList.remove("willmove"));
+      if (moveSel){ el.classList.add("on"); el.closest(".p")?.classList.add("willmove"); }
+    };
   });
 }
 
@@ -519,9 +608,13 @@ function renderArchive(r){
 }
 async function keep(pid){
   if(!currentCluster) return;
+  const body={path_id:pid};
+  let movedTo=null;
+  if(moveSel && moveSel.pid===pid){ body.move_dest=moveSel.dest; movedTo=moveSel.dest.label||moveSel.dest.path; }
   await api(`/api/clusters/${currentCluster.id}/keep`,{method:"POST",
-    headers:{"content-type":"application/json"},body:JSON.stringify({path_id:pid})});
-  toast("kept 1, rest → purgatory");
+    headers:{"content-type":"application/json"},body:JSON.stringify(body)});
+  toast(movedTo ? `kept 1 + queued move → ${movedTo}` : "kept 1, rest → purgatory");
+  moveSel=null;
   queue.splice(qi,1); await renderCluster(); refreshHint();
 }
 async function purgeAll(){
@@ -534,6 +627,10 @@ function skip(){ qi++; renderCluster(); }
 async function undo(){
   try {
     const r = await api("/api/undo",{method:"POST"});
+    if (r.needs_process_undo){
+      toast("that was an executed move — undo it from Purgatory → Undo last process");
+      return;
+    }
     toast("undid "+r.action);
     await loadQueue();
   } catch(e){ toast(e.message); }
@@ -638,9 +735,10 @@ async function runSearch(){
   }</tbody></table><p class="hint" style="margin-top:10px">${r.results.length} result(s)</p>`;
 }
 
-// ---- purgatory ----
+// ---- purgatory + process ----
 async function loadPurgatory(){
-  const r = await api("/api/purgatory");
+  const [r, pend] = await Promise.all([api("/api/purgatory"), api("/api/pending")]);
+  renderProcPanel(pend);
   $("#purgMeta").textContent = `${r.count} item(s) · ${fmtBytes(r.bytes)} reclaimed`;
   if (!r.items.length){
     $("#purgBody").innerHTML = `<div class="empty">Purgatory is empty.<br>
@@ -661,11 +759,107 @@ async function loadPurgatory(){
   });
 }
 async function restorePath(pid){
-  const r = await api(`/api/paths/${pid}/restore`,{method:"POST"});
-  const n = r.reopened_clusters.length;
-  toast(n ? `restored · ${n} cluster(s) reopened` : "restored to active");
-  await loadPurgatory(); refreshHint();
+  try {
+    const r = await api(`/api/paths/${pid}/restore`,{method:"POST"});
+    const n = r.reopened_clusters.length;
+    toast(n ? `restored · ${n} cluster(s) reopened` : "restored to active");
+    await loadPurgatory(); refreshHint();
+  } catch(e){ toast(e.message); }   // e.g. a file already moved to holding
 }
+
+function renderProcPanel(p){
+  const holdWarn = p.holding_dir ? "" :
+    `<span class="warnote">⚠ set a holding folder in Settings before processing</span>`;
+  $("#procPanel").innerHTML = `
+    <div class="proc-row">
+      <span class="proc-q">keepers to move: <b>${p.keepers.length}</b> · ${fmtBytes(p.keeper_bytes)}</span>
+      <span class="proc-q dup">dups to remove: <b>${p.dups.length}</b> · ${fmtBytes(p.dup_bytes)}</span>
+      <span class="hint">holding: ${p.holding_dir?esc(p.holding_dir):"(unset)"} ${holdWarn}</span>
+    </div>
+    <div class="proc-row">
+      <button class="act" id="dryBtn">Dry run</button>
+      <button class="act" id="procBtn">Process now</button>
+      <button class="act" id="undoProcBtn">Undo last process</button>
+    </div>
+    <div class="proc-log" id="procLog"></div>`;
+  $("#dryBtn").onclick=()=>runProcess(true);
+  $("#procBtn").onclick=()=>runProcess(false);
+  $("#undoProcBtn").onclick=undoProcess;
+}
+let pes=null;
+function runProcess(dry){
+  if(pes){ pes.close(); pes=null; }
+  if(!dry && !confirm("Process MOVES files on disk: keepers to their destinations and "+
+      "duplicates into the holding folder. Everything is reversible from 'Undo last process'. Continue?")) return;
+  const log=$("#procLog"); log.textContent = dry ? "dry run…\n" : "processing…\n";
+  pes=new EventSource(`/api/process/stream?dry_run=${dry?"true":"false"}`);
+  pes.onmessage=ev=>{
+    const m=JSON.parse(ev.data);
+    if(m.kind==="started") log.textContent += `${m.dry_run?"DRY-RUN":"PROCESS"} — ${m.total} relocation(s): ${m.keepers} keeper(s), ${m.dups} dup(s)\n`;
+    else if(m.kind==="planned") log.textContent += `  would move (${m.kind2}) ${m.path} → ${m.dest_rel}\n`;
+    else if(m.kind==="moved") log.textContent += `  moved (${m.kind2}) ${m.path} → ${m.dest_rel}\n`;
+    else if(m.kind==="conflict") log.textContent += `  SKIP ${m.path}: ${m.reason}\n`;
+    else if(m.kind==="error"){ log.textContent += `  ERROR ${m.path||""}: ${m.error}\n`; if(m.fatal && pes){ pes.close(); pes=null; } }
+    else if(m.kind==="done"){
+      log.textContent += `done — moved ${m.moved}, skipped ${m.skipped}\n`;
+      if(pes){ pes.close(); pes=null; }
+      if(!m.dry_run){ toast("processed"); loadPurgatory(); refreshHint(); }
+    }
+    log.scrollTop=log.scrollHeight;
+  };
+  pes.onerror=()=>{ if(pes){ pes.close(); pes=null; } };
+}
+async function undoProcess(){
+  try {
+    const r=await api("/api/process/undo",{method:"POST"});
+    toast("undid "+r.action+(r.restored_to?` → ${r.restored_to.split(/[\\/]/).pop()}`:""));
+    loadPurgatory(); refreshHint();
+  } catch(e){ toast(e.message); }
+}
+
+// ---- settings form ----
+function destRowHtml(d){
+  return `<div class="destrow">
+    <input class="lbl" type="text" placeholder="label (e.g. ~/3d-nodupe)" value="${esc(d.label||"")}">
+    <input class="pth" type="text" placeholder="absolute path (e.g. D:/3d-nodupe)" value="${esc(d.path||"")}">
+    <button class="act" data-rmdest="1">✕</button></div>`;
+}
+function wireDestRemove(){
+  document.querySelectorAll("[data-rmdest]").forEach(el=>el.onclick=()=>{ el.closest(".destrow").remove(); refreshAddDest(); });
+}
+function refreshAddDest(){
+  const n=document.querySelectorAll("#destRows .destrow").length;
+  $("#addDest").style.display = (n >= (settings.max_destinations||5)) ? "none" : "inline-block";
+}
+function renderSettingsForm(){
+  const rows = (settings.destinations||[]);
+  $("#destRows").innerHTML = (rows.length?rows:[{label:"",path:""}]).map(destRowHtml).join("");
+  $("#holdingDir").value = settings.holding_dir||"";
+  $("#highlightPats").value = (settings.highlight_patterns||[]).join("\n");
+  $("#settingsNote").textContent = "";
+  wireDestRemove(); refreshAddDest();
+}
+$("#addDest").onclick=()=>{
+  if(document.querySelectorAll("#destRows .destrow").length >= (settings.max_destinations||5)) return;
+  $("#destRows").insertAdjacentHTML("beforeend", destRowHtml({label:"",path:""}));
+  wireDestRemove(); refreshAddDest();
+};
+$("#saveSettings").onclick=async()=>{
+  const dests=[...document.querySelectorAll("#destRows .destrow")].map(r=>({
+    label:r.querySelector(".lbl").value.trim()||null,
+    path:r.querySelector(".pth").value.trim()
+  })).filter(d=>d.path);
+  const holding=$("#holdingDir").value.trim()||null;
+  const pats=$("#highlightPats").value.split("\n").map(s=>s.trim()).filter(Boolean);
+  try{
+    settings = await api("/api/settings",{method:"POST",
+      headers:{"content-type":"application/json"},
+      body:JSON.stringify({destinations:dests,holding_dir:holding,highlight_patterns:pats})});
+    settingsLoaded=true;
+    $("#settingsNote").textContent="saved ✓"; toast("settings saved");
+    renderSettingsForm();
+  }catch(e){ toast(e.message); }
+};
 
 // ---- keyboard ----
 document.addEventListener("keydown", e=>{
@@ -687,6 +881,7 @@ document.addEventListener("keydown", e=>{
 });
 
 loadOverview();
+loadSettings();
 </script>
 </body>
 </html>

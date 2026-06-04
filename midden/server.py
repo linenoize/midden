@@ -17,6 +17,7 @@ import string
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import Optional
 from urllib.parse import urlparse
 
 from fastapi import FastAPI, HTTPException, Request, Response
@@ -24,7 +25,7 @@ from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from . import archives, near, topics
+from . import archives, near, organize, topics
 from .ingest import ingest as run_ingest
 from .store import Store
 
@@ -34,9 +35,25 @@ UI_DIR = Path(__file__).parent / "ui"
 LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
 _MUTATING_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
 
+MAX_DESTINATIONS = 5
+
+
+class MoveDest(BaseModel):
+    label: Optional[str] = None
+    path: str
+
 
 class KeepBody(BaseModel):
     path_id: int
+    # Optional: also queue the kept file to be moved to this destination during
+    # the `process` step (organize.py). Index-only + reversible until processed.
+    move_dest: Optional[MoveDest] = None
+
+
+class SettingsBody(BaseModel):
+    destinations: list[MoveDest] = []
+    holding_dir: Optional[str] = None
+    highlight_patterns: list[str] = []
 
 
 def create_app(db_path: Path, materialize: bool = True) -> FastAPI:
@@ -141,8 +158,10 @@ def create_app(db_path: Path, materialize: bool = True) -> FastAPI:
 
     @app.post("/api/clusters/{cluster_id}/keep")
     def keep(cluster_id: int, body: KeepBody) -> dict:
+        dest = ({"label": body.move_dest.label, "path": body.move_dest.path}
+                if body.move_dest else None)
         try:
-            return store.resolve_keep(cluster_id, body.path_id)
+            return store.resolve_keep(cluster_id, body.path_id, move_dest=dest)
         except ValueError as e:
             raise HTTPException(400, str(e))
 
@@ -199,6 +218,82 @@ def create_app(db_path: Path, materialize: bool = True) -> FastAPI:
             return store.restore_path(path_id)
         except ValueError as e:
             raise HTTPException(400, str(e))
+
+    # ---- organize: settings, queues, and the destructive process step ----
+    @app.get("/api/settings")
+    def get_settings() -> dict:
+        return {
+            "destinations": store.get_destinations(),
+            "holding_dir": store.get_holding_dir(),
+            "highlight_patterns": store.get_highlight_patterns(),
+            "max_destinations": MAX_DESTINATIONS,
+        }
+
+    @app.post("/api/settings")
+    def set_settings(body: SettingsBody) -> dict:
+        if len(body.destinations) > MAX_DESTINATIONS:
+            raise HTTPException(400, f"at most {MAX_DESTINATIONS} destinations")
+        dests = [{"label": d.label, "path": d.path} for d in body.destinations if d.path]
+        store.set_destinations(dests)
+        store.set_holding_dir(body.holding_dir or None)
+        store.set_highlight_patterns([p for p in body.highlight_patterns if p.strip()])
+        # Register destinations + holding as managed drives now, so ingest/reconcile
+        # skip them immediately (before any file is ever moved there).
+        for d in dests:
+            store.ensure_managed_drive(d["path"], d["label"])
+        if body.holding_dir:
+            store.ensure_managed_drive(body.holding_dir, "holding")
+        return get_settings()
+
+    @app.get("/api/pending")
+    def pending() -> dict:
+        keepers = store.list_pending(kind="keeper", statuses=("pending",))
+        dups = store.dup_candidates()
+        return {
+            "keepers": [{"path_id": k["path_id"], "rel": k["rel"], "size": k["size"],
+                         "dest_label": k["dest_label"], "dest_root": k["dest_root"]}
+                        for k in keepers],
+            "dups": [{"path_id": d["path_id"], "rel": d["rel"], "size": d["size"]}
+                     for d in dups],
+            "keeper_bytes": sum(k["size"] or 0 for k in keepers),
+            "dup_bytes": sum(d["size"] or 0 for d in dups),
+            "holding_dir": store.get_holding_dir(),
+        }
+
+    @app.post("/api/process/undo")
+    def process_undo() -> dict:
+        try:
+            result = organize.undo_last_process(store)
+        except (ValueError, OSError) as e:
+            raise HTTPException(400, str(e))
+        if result is None:
+            raise HTTPException(400, "no processed relocation to undo")
+        return {**result, **store.overview()}
+
+    @app.get("/api/process/stream")
+    def process_stream(dry_run: bool = True, verify: bool = True):
+        """Execute (or preview) the queued relocations, streaming SSE progress.
+
+        Dedicated Store connection (the move loop is slow and must not hold the
+        request-thread connection). dry_run=True (the default) previews only.
+        """
+        def sse(obj: dict) -> str:
+            return f"data: {json.dumps(obj)}\n\n"
+
+        def gen():
+            job = Store(db_path, same_thread=False)
+            try:
+                for ev in organize.process(job, dry_run=dry_run, verify=verify):
+                    if ev.get("kind") == "done":
+                        yield sse({**ev, "overview": job.overview()})
+                    else:
+                        yield sse(ev)
+            except Exception as e:  # noqa: BLE001 — surface anything to the client
+                yield sse({"kind": "error", "fatal": True, "error": str(e)})
+            finally:
+                job.close()
+
+        return StreamingResponse(gen(), media_type="text/event-stream")
 
     @app.get("/api/archive/{path_id}")
     def archive(path_id: int) -> dict:

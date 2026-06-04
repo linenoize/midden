@@ -64,6 +64,15 @@ def reconcile_drive(
     drive = store.get_drive(drive_id)
     if drive is None:
         raise ValueError(f"unknown drive: {drive_id}")
+    # Managed drives (organize destinations / holding folder) are never reconciled:
+    # their rows are written by organize.py and a "missing" file there means the
+    # user moved it by hand, not that the index is stale. Reconciling them could
+    # hard-delete a legitimately-relocated keeper.
+    if drive["kind"] == "managed":
+        return {"drive_id": drive_id, "label": drive["label"],
+                "root_path": drive["root_path"], "checked": 0, "missing": 0,
+                "bytes_missing": 0, "deleted": 0, "dry_run": dry_run,
+                "root_unreachable": False, "skipped_managed": True, "sample": []}
     root = drive["root_path"]
     rows = store.active_paths_for_drive(drive_id)
 

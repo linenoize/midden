@@ -23,6 +23,9 @@ These were decided up front. If you want to change one, surface it to the user f
 1. **Content-addressed identity.** Files are identified by hash, not path. Paths are observations.
 2. **Read-only ingest.** Never modify originals. Only exception: `.midden_drive.json` marker file at each drive's root (one tiny write per drive, once).
 3. **No deletion, ever.** "Delete" = move to purgatory + hide from default views. Infinite retention default. *Exception (decided with the user, 2026-06):* `reconcile` / `ingest --prune` **hard-delete** `paths` rows whose files are gone from disk — these are stale *observations*, not the user's data, and leaving them creates phantom duplicates. Every such delete is snapshotted into the `decisions` table first (so it's reversible per #7), gated behind a real `stat` check, and refuses to run when a drive root is unreachable (unmounted ≠ deleted). `files`/cluster/tag rows are never deleted by reconcile.
+   - *Second sanctioned-destructive exception (decided with the user, 2026-06): `process` (`organize.py`).* The review queue only *queues* relocations (the `pending_moves` table); the **`process` step physically moves files** — kept files to a chosen destination, purgatory dups into a user-defined **holding folder** (the "delete" = reversible trash, never `unlink`). It carries the same guarantees as reconcile: snapshot-before (`apply_move`/`apply_remove` decisions), refuse when any **source** root is unreachable, re-hash each source before moving (skip on mismatch), and full reversal via `undo_last_process` while originals remain in holding/destination. **The filesystem is the source of truth, the index follows:** each move is a two-phase `pending`→`moving`→`executed` op so a crash is recoverable (`reconcile_pending`), never an auto-delete.
+
+9. **Managed drives.** Organize destinations + the holding folder are `drives` rows with `kind='managed'` (vs `'scanned'`). They carry **no `.midden_drive.json` marker** (we never write into the user's target folders) and are **never walked by ingest or touched by reconcile** — that's what lets a destination live *inside* an already-scanned disk without re-discovering relocated files and rebuilding the resolved dup groups. `store.py` owns this vocabulary alongside `files.status` / `clusters.kind` / `tags.source`.
 4. **SQLite as the index.** Single file, WAL mode. Good until proven otherwise.
 5. **Cluster-first UX, not folder-first.** The unit of human attention is a cluster (exact dups, version chains, inferred projects). Don't build a folder tree browser as the primary view.
 6. **LLM enrichment is async + additive.** Index works without it. Don't make it a hard dependency.
@@ -103,6 +106,7 @@ midden/
     drives.py          # stable drive IDs via .midden_drive.json marker
     ingest.py          # walk + hash + insert; read-only, idempotent; batched writes; yields events
     reconcile.py       # stat known paths; hard-delete vanished ones (snapshot to decisions); FS boundary
+    organize.py        # the read-WRITE FS boundary: execute queued keeper/dup moves (process); crash-recoverable
     near.py            # near-duplicate clustering orchestration
     simhash.py         # text simhash fingerprints
     phash.py           # image perceptual (dHash) fingerprints
@@ -121,6 +125,7 @@ The user's preferences: concise/direct, no sycophancy, push back when you have a
 
 Highest-risk zones — cross-file rules where a careless edit corrupts data:
 - `midden/store.py` — sole owner of the SQLite schema and the `files.status` / `clusters.kind` / `tags.source` vocabularies.
-- `midden/ingest.py` — the read-only boundary; the only sanctioned write to a scanned tree is the `.midden_drive.json` marker.
+- `midden/ingest.py` — the read-only boundary; the only sanctioned write to a scanned tree is the `.midden_drive.json` marker. Also skips `managed`-drive subtrees so relocated files aren't re-discovered.
+- `midden/organize.py` — the read-WRITE boundary; the ONLY code that moves/relocates user files. Two-phase, crash-recoverable, snapshot-before, refuse-on-unreachable-source. A careless edit here loses data.
 - `midden/drives.py` — `MARKER` name is drive identity; changing it orphans every prior ingest.
 

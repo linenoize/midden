@@ -25,7 +25,13 @@ rationale and [`docs/ROADMAP.md`](docs/ROADMAP.md) for where it's going.
   then clusters files into inferred "projects." Works offline with a deterministic stub,
   or with a local LAN LLM server (OpenAI-compatible), or the Anthropic API.
 - **Cluster review UI** — a single web page for working through clusters one at a time:
-  pick the canonical copy, send the rest to purgatory, skip, undo. Keyboard-driven.
+  pick the canonical copy, send the rest to purgatory, skip, undo. Keyboard-driven. Configure
+  up to 5 destination folders and "keeper" path fragments that highlight the copy you want.
+- **Organize on process** — optionally queue a kept file to be *moved* into a central
+  destination folder, then run `process` to physically relocate keepers and sweep purgatory
+  duplicates into a **holding folder** (reversible trash). Moves mirror source subfolders,
+  never overwrite, re-verify each file's hash first, and are fully reversible (`undo last
+  process`). This is the only step that ever writes outside a scanned tree's marker.
 - **Purgatory, not deletion** — "delete" means hide from default views; every action is
   logged and fully reversible.
 
@@ -119,8 +125,15 @@ python -m midden.cli [--db PATH] <command>
   dups    [--min-size N] [--limit N] [--json]   list exact-duplicate groups
   cluster [--reset-near] [--recompute-images]   detect exact + near duplicates
   topics  [--backend auto|stub|local|anthropic] [--model M] [--llm-url URL] [--limit N]
+  config  [--add-dest [LABEL=]PATH] [--holding DIR] [--add-highlight FRAG]   organize settings
+  process [--dry-run] [--no-verify]         move queued keepers + sweep dups to the holding folder
   serve   [--host H] [--port N] [--allow-remote] [--skip-materialize]   cluster-review web UI
 ```
+
+`process` is the one destructive step: it physically moves kept files to their configured
+destinations and purgatory duplicates into the holding folder (set via `config --holding`).
+Run `process --dry-run` first to preview. Every move is reversible from the index; the
+holding folder is your trash — empty it yourself once you're satisfied.
 
 The index defaults to `~/.midden/index.sqlite`; pass `--db` to use another location.
 
@@ -199,6 +212,7 @@ midden/
     store.py       # SQLite schema + access layer (sole owner of the schema)
     drives.py      # stable drive IDs via the .midden_drive.json marker
     ingest.py      # read-only walk + hash + insert; idempotent; yields events
+    organize.py    # read-WRITE FS boundary: execute queued keeper/dup moves (process)
     near.py        # near-duplicate clustering orchestration
     simhash.py     # text simhash fingerprints
     phash.py       # image perceptual (dHash) fingerprints
