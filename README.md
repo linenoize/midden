@@ -96,15 +96,56 @@ Re-running ingest hashes nothing the second time — it's idempotent.
 ```
 python -m midden.cli [--db PATH] <command>
 
-  ingest  <ROOT> [--label NAME] [--quiet]   walk a directory and index it
+  ingest  <ROOT> [--label NAME] [--quiet] [--prune]   walk a directory and index it
+  reconcile [--drive ID] [--dry-run]        remove index paths no longer on disk
   stats                                     print index stats
   dups    [--min-size N] [--limit N] [--json]   list exact-duplicate groups
-  cluster                                   detect exact + near duplicates
+  cluster [--reset-near] [--recompute-images]   detect exact + near duplicates
   topics  [--backend auto|stub|ollama|anthropic] [--model M] [--limit N]
-  serve   [--host H] [--port N]             run the cluster-review web UI
+  serve   [--host H] [--port N] [--allow-remote]   run the cluster-review web UI
 ```
 
 The index defaults to `~/.midden/index.sqlite`; pass `--db` to use another location.
+
+## Upgrading or repairing an existing index
+
+After pulling a new version, point the new code at your existing index — the **schema
+migrates automatically** on open (new columns are added idempotently), so there's nothing
+to run for the schema itself.
+
+The **data**, however, doesn't fix itself. Clustering results are stored in the index, so
+an index built by an older version keeps whatever the old clustering produced. Two cases:
+
+- **Rebuild near-image clusters.** Earlier versions could collapse large numbers of
+  unrelated images into one giant cluster (blank/uniform images hashing alike, then
+  chaining together). The fix lives in the clusterer, but the bad cluster is already
+  persisted — rebuild it:
+
+  ```bash
+  python -m midden.cli --db <your.sqlite> cluster --reset-near --recompute-images
+  ```
+
+  `--reset-near` drops the existing `near_image` clusters before rebuilding;
+  `--recompute-images` re-reads images to backfill the dimensions newer versions need for
+  the aspect-ratio prior (older indexes have them empty). Both are reversible — the reset
+  is snapshotted to the `decisions` log. Exact-duplicate and version-chain clusters, and
+  your `files`/`paths` rows, are left untouched.
+
+- **Clear out stale paths.** If files moved or were deleted on disk since the last ingest,
+  the index still lists their old locations — which can show up as phantom duplicates.
+  `reconcile` removes index paths whose files are gone (use `--dry-run` first to preview):
+
+  ```bash
+  python -m midden.cli --db <your.sqlite> reconcile --dry-run
+  python -m midden.cli --db <your.sqlite> reconcile
+  ```
+
+  This only deletes vanished *path observations* (snapshotted for undo), never your files;
+  it refuses to run against a drive whose root is unreachable, so an unmounted drive is
+  never mistaken for a deleted one.
+
+`tools/diagnose.py` is a read-only check (re-hashes exact-dup groups, flags image
+pathologies) if you want to inspect an index without changing it.
 
 ## A note on safety
 
