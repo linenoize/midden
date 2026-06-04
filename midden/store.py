@@ -530,6 +530,21 @@ class Store:
         return {r["hash"] for r in self.conn.execute(
             "SELECT hash FROM signatures WHERE algo='phash_image' AND (w IS NULL OR h IS NULL)")}
 
+    def path_abspath(self, path_id: int) -> Optional[str]:
+        """Absolute on-disk path for a specific path row (drive root + rel),
+        resolved strictly from the DB. Used to inspect a concrete file location."""
+        r = self.conn.execute(
+            """
+            SELECT d.root_path AS root_path, p.path AS path
+            FROM paths p JOIN drives d ON d.id=p.drive_id
+            WHERE p.id=?
+            """,
+            (path_id,),
+        ).fetchone()
+        if not r:
+            return None
+        return str(Path(r["root_path"]) / r["path"]) if r["root_path"] else r["path"]
+
     def thumb_source(self, hash_: str) -> Optional[str]:
         """Absolute path of ONE active location for `hash_`, for thumbnailing.
         Resolved strictly from the DB (never a client-supplied path)."""

@@ -23,7 +23,7 @@ from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from . import near, topics
+from . import archives, near, topics
 from .ingest import ingest as run_ingest
 from .store import Store
 
@@ -164,6 +164,18 @@ def create_app(db_path: Path) -> FastAPI:
             return store.restore_path(path_id)
         except ValueError as e:
             raise HTTPException(400, str(e))
+
+    @app.get("/api/archive/{path_id}")
+    def archive(path_id: int) -> dict:
+        """List the contents of an archive at a specific path (read-only, never
+        extracts). Lets the reviewer confirm what's inside a duplicate archive
+        when the outer filenames differ. Path resolved strictly from the DB."""
+        src = store.path_abspath(path_id)
+        if not src:
+            raise HTTPException(404, f"No such path: {path_id}")
+        if not archives.is_archive(src):
+            raise HTTPException(400, "not a recognized archive")
+        return {"path_id": path_id, **archives.list_archive(Path(src))}
 
     @app.get("/api/dirs")
     def dirs(path: str = "") -> dict:

@@ -57,6 +57,23 @@
     width:48px; height:48px; object-fit:cover; border-radius:4px;
     border:1px solid var(--line); flex:none; background:#0d0f15;
   }
+  .arch-btn {
+    background:var(--panel); color:var(--dim); border:1px solid var(--line);
+    border-radius:6px; padding:3px 8px; font:inherit; font-size:11px; cursor:pointer; flex:none;
+  }
+  .arch-btn:hover { border-color:var(--accent); color:var(--ink); }
+  .arch-in {
+    margin:-2px 0 8px 34px; border:1px solid var(--line); border-left:3px solid var(--accent);
+    border-radius:6px; background:#0d0f15; padding:8px 10px; font-size:12px;
+  }
+  .arch-in.err { border-left-color:var(--warn); color:var(--warn); }
+  .arch-head { color:var(--dim); margin-bottom:6px; }
+  .alist { max-height:260px; overflow:auto; display:flex; flex-direction:column; }
+  .arow { display:flex; gap:10px; padding:2px 4px; }
+  .arow:hover { background:var(--panel2); }
+  .arow .an { flex:1; word-break:break-all; }
+  .arow.d .an { color:var(--accent); }
+  .arow .az { color:var(--dim); white-space:nowrap; }
   .paths { display:flex; flex-direction:column; gap:8px; }
   .p {
     display:flex; align-items:center; gap:12px; padding:10px 12px;
@@ -443,10 +460,12 @@ async function renderCluster(){
       : `<div class="drive">drive ${p.drive_id.slice(0,8)}</div>`;
     const thumb = isImg
       ? `<img class="thumb" src="/api/thumb/${p.hash}" loading="lazy" alt="" onerror="this.style.visibility='hidden'">` : "";
+    const archBtn = isArchiveName(p.path)
+      ? `<button class="arch-btn" data-arch="${p.id}" title="list archive contents (read-only)">📦 inside</button>` : "";
     return `<div class="p ${p.status==='purgatory'?'purged':''}" data-pid="${p.id}" data-keep="${p.status==='active'}">
       <div class="idx">${activeIdx??"·"}</div>${thumb}
       <div style="flex:1"><div class="path">${esc(p.path)}</div>${meta}</div>
-      ${badge}</div>`;
+      ${archBtn}${badge}</div><div class="arch" id="arch-${p.id}"></div>`;
   }).join("");
   const sub = multi
     ? `${c.n_active} ${c.n_active===1?KIND.noun:KIND.nouns} · ${fmtBytes(c.reclaimable)} reclaimable`
@@ -465,6 +484,38 @@ async function renderCluster(){
   document.querySelectorAll(".p[data-keep='true']").forEach(el=>{
     el.onclick=()=>keep(parseInt(el.dataset.pid));
   });
+  // archive "peek inside" — stop propagation so it doesn't trigger keep
+  document.querySelectorAll(".arch-btn[data-arch]").forEach(el=>{
+    el.onclick=e=>{ e.stopPropagation(); toggleArchive(parseInt(el.dataset.arch)); };
+  });
+}
+
+// ---- archive inspection (read-only listing) ----
+const ARCHIVE_RE=/\.(zip|7z|rar|tar|gz|tgz|bz2|tbz2?|xz|txz|zst|cbz|cbr|cb7|jar|war|whl|epub|apk|iso)$|\.tar\.(gz|bz2|xz|zst)$/i;
+const isArchiveName=n=>ARCHIVE_RE.test(n||"");
+async function toggleArchive(pid){
+  const box=document.getElementById("arch-"+pid);
+  if(!box) return;
+  if(box.dataset.open==="1"){ box.dataset.open="0"; box.innerHTML=""; return; }
+  box.dataset.open="1";
+  box.innerHTML=`<div class="arch-in">reading archive… (listing only, nothing is extracted)</div>`;
+  try{
+    box.innerHTML=renderArchive(await api("/api/archive/"+pid));
+  }catch(e){ box.innerHTML=`<div class="arch-in err">⚠ ${esc(e.message)}</div>`; }
+}
+function renderArchive(r){
+  if(!r.ok){
+    return `<div class="arch-in err">⚠ ${esc(r.error||"could not read archive")}${r.encrypted?" · 🔒 encrypted":""}</div>`;
+  }
+  const head=`<div class="arch-head">${r.entry_count.toLocaleString()} `+
+    `entr${r.entry_count===1?'y':'ies'} · ${fmtBytes(r.total_size)} uncompressed · `+
+    `${esc(r.format)} via ${esc(r.backend)}`+
+    `${r.truncated?` · showing first ${r.entries.length.toLocaleString()}`:""}`+
+    `${r.encrypted?' · 🔒 encrypted':''}</div>`;
+  const rows=r.entries.map(e=>`<div class="arow${e.is_dir?' d':''}">`+
+    `<span class="an">${esc(e.name)}</span>`+
+    `<span class="az">${e.is_dir?'dir':(e.size?fmtBytes(e.size):'—')}</span></div>`).join("");
+  return `<div class="arch-in">${head}<div class="alist">${rows}</div></div>`;
 }
 async function keep(pid){
   if(!currentCluster) return;
